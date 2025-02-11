@@ -111,6 +111,22 @@ func New(uri string, cfg *sqlcommon.Config) (*Datastore, error) {
 		}
 	}
 
+	if cfg.MaxOpenConns != 0 {
+		db.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+
+	if cfg.MaxIdleConns != 0 {
+		db.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+
+	if cfg.ConnMaxIdleTime != 0 {
+		db.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
+	}
+
+	if cfg.ConnMaxLifetime != 0 {
+		db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	}
+
 	stbl := sq.StatementBuilder.RunWith(db)
 	dbInfo := sqlcommon.NewDBInfo(db, stbl, HandleSQLError, "sqlite")
 
