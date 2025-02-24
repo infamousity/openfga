@@ -10,6 +10,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common"
 	celtypes "github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/ext"
 	"go.opentelemetry.io/otel"
 	"golang.org/x/exp/maps"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -30,7 +31,25 @@ func init() {
 		envOpts = append(envOpts, customTypeOpts...)
 	}
 
-	envOpts = append(envOpts, types.IPAddressEnvOption(), cel.EagerlyValidateDeclarations(true))
+	envOpts = append(envOpts,
+		types.IPAddressEnvOption(),
+		cel.HomogeneousAggregateLiterals(),
+		cel.StdLib(),
+		cel.EagerlyValidateDeclarations(true),
+		cel.DefaultUTCTimeZone(true),
+		cel.CrossTypeNumericComparisons(true),
+		cel.OptionalTypes(),
+		cel.ASTValidators(
+			cel.ValidateDurationLiterals(),
+			cel.ValidateTimestampLiterals(),
+			cel.ValidateRegexLiterals(),
+			cel.ValidateHomogeneousAggregateLiterals(),
+		),
+		ext.Protos(),
+		ext.Sets(),
+		ext.Strings(),
+		ext.Bindings(),
+		ext.Math())
 
 	env, err := cel.NewEnv(envOpts...)
 	if err != nil {
