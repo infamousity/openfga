@@ -74,7 +74,7 @@ func WithCachedDatastoreLogger(logger logger.Logger) CachedDatastoreOpt {
 }
 
 // CachedDatastore is a wrapper over a datastore that caches iterators in memory.
-// It can only be used for Check API requests.
+// It can only be used for Check API requests. // TODO: not sure about that.
 type CachedDatastore struct {
 	storage.RelationshipTupleReader
 
