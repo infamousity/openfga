@@ -302,6 +302,8 @@ func (q *ListObjectsQuery) evaluate(
 			reverseexpand.WithLogger(q.logger),
 		)
 
+		// Used by subsequent checks
+		ctx = storage.ContextWithRelationshipTupleReader(ctx, ds)
 		reverseExpandDoneWithError := make(chan struct{}, 1)
 		cancelCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -362,9 +364,14 @@ func (q *ListObjectsQuery) evaluate(
 				furtherEvalRequiredCounter.Inc()
 
 				pool.Go(func(ctx context.Context) error {
-					resp, checkRequestMetadata, err := NewCheckCommand(q.datastore, q.checkResolver, typesys,
+					resp, checkRequestMetadata, err := NewCheckCommand(
+						q.datastore,
+						q.checkResolver,
+						typesys,
 						WithCheckCommandLogger(q.logger),
 						WithCheckCommandMaxConcurrentReads(q.maxConcurrentReads),
+						// TODO: verify usage here, is having the reader in context enough?
+						//WithCheckCommandCache(q.sharedCheckResources, q.cacheSettings),
 					).
 						Execute(ctx, &CheckCommandParams{
 							StoreID:          req.GetStoreId(),
