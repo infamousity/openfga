@@ -52,6 +52,20 @@ func (mr *MockInMemoryCacheMockRecorder[T]) Delete(prefix any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockInMemoryCache[T])(nil).Delete), prefix)
 }
 
+// EstimatedSize mocks base method.
+func (m *MockInMemoryCache[T]) EstimatedSize() int {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "EstimatedSize")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+// EstimatedSize indicates an expected call of EstimatedSize.
+func (mr *MockInMemoryCacheMockRecorder[T]) EstimatedSize() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EstimatedSize", reflect.TypeOf((*MockInMemoryCache[T])(nil).EstimatedSize))
+}
+
 // Get mocks base method.
 func (m *MockInMemoryCache[T]) Get(key string) T {
 	m.ctrl.T.Helper()

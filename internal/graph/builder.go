@@ -44,6 +44,7 @@ func WithCachedCheckResolverOpts(enabled bool, opts ...CachedCheckResolverOpt) C
 	return func(r *CheckResolverOrderedBuilder) {
 		r.cachedCheckResolverEnabled = enabled
 		r.cachedCheckResolverOptions = opts
+		// TODO: maybe metric config here
 	}
 }
 

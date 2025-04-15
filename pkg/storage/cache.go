@@ -38,6 +38,8 @@ type InMemoryCache[T any] interface {
 
 	// Stop cleans resources.
 	Stop()
+
+	EstimatedSize() int
 }
 
 // Specific implementation
@@ -105,6 +107,10 @@ func (i InMemoryLRUCache[T]) Stop() {
 	i.stopOnce.Do(func() {
 		i.client.Close()
 	})
+}
+
+func (i InMemoryLRUCache[T]) EstimatedSize() int {
+	return i.client.EstimatedSize()
 }
 
 type ChangelogCacheEntry struct {

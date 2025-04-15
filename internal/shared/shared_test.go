@@ -61,7 +61,7 @@ func TestSharedCheckResources(t *testing.T) {
 		t.Cleanup(s.Close)
 
 		require.NotNil(t, s.CacheController)
-		_, ok := s.CacheController.(*cachecontroller.InMemoryCacheController)
+		_, ok := s.CacheController.(*cachecontroller.InMemoryCacheController[any])
 		require.True(t, ok)
 	})
 }
