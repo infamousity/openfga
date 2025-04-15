@@ -343,7 +343,7 @@ func TestInMemoryCacheController_findChangesAndInvalidate(t *testing.T) {
 
 			test.setMocks(mockCache, mockDatastore)
 
-			cacheController := &InMemoryCacheController[any]{
+			cacheController := &InMemoryCacheController{
 				ds:                    mockDatastore,
 				cache:                 mockCache,
 				ttl:                   10 * time.Second,
