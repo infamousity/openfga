@@ -330,6 +330,17 @@ func WriteCheckCacheKey(w io.StringWriter, params *CheckCacheKeyParams) error {
 	return nil
 }
 
+func WriteCheckCacheKeyV2(w io.StringWriter, params *CheckCacheKeyParams) error {
+	t := tuple.From(params.TupleKey)
+
+	_, err := w.WriteString(t.String())
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func WriteInvariantCheckCacheKey(w io.StringWriter, params *CheckCacheKeyParams) error {
 	_, err := w.WriteString(
 		" " + // space to separate from user in the TupleCacheKey, where spaces cannot be present

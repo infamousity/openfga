@@ -906,6 +906,25 @@ func BenchmarkWriteCheckCacheKey(b *testing.B) {
 	}
 }
 
+func BenchmarkWriteCheckCacheKeyWithoutContextOrCtxTuples(b *testing.B) {
+	var err error
+	writer := &strings.Builder{}
+	require.NoError(b, err)
+
+	params := &CheckCacheKeyParams{
+		AuthorizationModelID: ulid.Make().String(),
+		StoreID:              ulid.Make().String(),
+	}
+
+	for n := 0; n < b.N; n++ {
+		err = WriteCheckCacheKeyV2(writer, params)
+		require.NoError(b, err)
+		writer.Reset()
+	}
+
+}
+
+/*
 // The invariant cache key is calculated once per check request. Any sub-problems re-use this portion of the key.
 func BenchmarkInvariantCacheKeyWithContextualTuples(b *testing.B) {
 	var err error
@@ -998,3 +1017,6 @@ func BenchmarkGetInvalidIteratorByUserObjectTypeCacheKeys(b *testing.B) {
 		_ = GetInvalidIteratorByUserObjectTypeCacheKeys(storeID, users, objectType)
 	}
 }
+
+
+*/
