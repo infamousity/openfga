@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -299,6 +300,7 @@ func (c *ReverseExpandQuery) execute(
 		sourceUserObj = userset.ObjectRelation.GetObject()
 		sourceUserRef = typesystem.DirectRelationReference(sourceUserType, userset.ObjectRelation.GetRelation())
 
+		// TODO: this will have to be tweaked since new edges don't behave the same
 		if req.edge != nil {
 			key := fmt.Sprintf("%s#%s", sourceUserObj, req.edge.String())
 			if _, loaded := c.visitedUsersetsMap.LoadOrStore(key, struct{}{}); loaded {
@@ -320,20 +322,29 @@ func (c *ReverseExpandQuery) execute(
 	wg := c.typesystem.GetWeightedGraph()
 	if wg != nil {
 		targetTypeRel := targetObjRef.GetType() + "#" + targetObjRef.GetRelation()
-		_, _, err := c.getEdgesFromWeightedGraph(
+		edges, needsCheck, err := c.getEdgesFromWeightedGraph(
 			wg,
 			targetTypeRel,
 			sourceUserType,
 			intersectionOrExclusionInPreviousEdges,
 		)
+		println(edges, needsCheck, err) // to shut up compiler
 
 		if err != nil {
 			return err
 		}
+
+		err = c.LoopOverWeightedEdges(
+			ctx,
+			edges,
+			needsCheck,
+			req,
+			resolutionMetadata,
+			resultChan,
+			sourceUserObj,
+		)
 	}
 
-	// TODO: another branch will implement this
-	// errs = c.LoopOnWeightedEdges(edges, ...otherStuff)
 	g := graph.New(c.typesystem)
 
 	edges, err := g.GetPrunedRelationshipEdges(targetObjRef, sourceUserRef)
@@ -658,17 +669,7 @@ func (c *ReverseExpandQuery) throttle(ctx context.Context, currentNumDispatch ui
 	}
 }
 
-// E.g. If we have `rel1: a AND b AND c`, this function will return the edge with the lowest weight. If they are identical weights,
-// it will return the first edge encountered.
-//
-// For BUT NOT relations, getEdgesFromWeightedGraph first checks if the BUT NOT applies to the source type, and if it
-// does it will mark this result as "requires check".
-// E.g. If we have `rel1: a OR b BUT NOT c` and we are searching for a "user", if 'c' does not lead to type user,
-// we do not mark as "requires check".
-// After determining whether this result will require check, getEdgesFromWeightedGraph will prune off the last edge of the
-// Exclusion, as the right-most edge is always the BUT NOT portion, and that edge has already been accounted for.
-//
-// getEdgesFromWeightedGraph returns a list of edges, boolean indicating whether Check is needed, and an error.
+// GetEdgesFromWeightedGraph returns a list of edges, boolean indicating whether Check is needed, and an error.
 func (c *ReverseExpandQuery) getEdgesFromWeightedGraph(
 	wg *weightedGraph.WeightedAuthorizationModelGraph,
 	targetTypeRelation string,
@@ -730,6 +731,79 @@ func (c *ReverseExpandQuery) getEdgesFromWeightedGraph(
 	relevantEdges := filter(edges, hasPathTo(sourceType))
 
 	return relevantEdges, needsCheck, nil
+}
+
+func (c *ReverseExpandQuery) LoopOverWeightedEdges(
+	ctx context.Context,
+	edges []*weightedGraph.WeightedAuthorizationModelEdge,
+	needsCheck bool,
+	req *ReverseExpandRequest,
+	resolutionMetadata *ResolutionMetadata,
+	resultChan chan<- *ReverseExpandResult,
+	sourceUserObj string,
+) error {
+	pool := concurrency.NewPool(ctx, int(c.resolveNodeBreadthLimit))
+
+	var errs error
+
+	for _, edge := range edges {
+		// TODO: i think the getEdgesFromWeightedGraph func handles this for us, shouldn't need this
+		// intersectionOrExclusionInPreviousEdges := intersectionOrExclusionInPreviousEdges || innerLoopEdge.TargetReferenceInvolvesIntersectionOrExclusion
+		r := &ReverseExpandRequest{
+			Consistency:      req.Consistency,
+			Context:          req.Context,
+			ContextualTuples: req.ContextualTuples,
+			ObjectType:       req.ObjectType,
+			Relation:         req.Relation,
+			StoreID:          req.StoreID,
+			User:             req.User,
+
+			// TODO: this is just for cycle prevention, refactor so we can use weighted edge here as well
+			//edge:             innerLoopEdge,
+			//edge:             edge.GetTo(), // this doesn't match the API
+		}
+		switch edge.GetEdgeType() {
+		case weightedGraph.DirectEdge:
+			pool.Go(func(ctx context.Context) error {
+				return c.reverseExpandDirect(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			})
+		case weightedGraph.ComputedEdge:
+			// follow the computed_userset edge, no new goroutine needed since it's not I/O intensive
+			to := edge.GetTo().GetUniqueLabel()
+
+			// turn "document#viewer" into "viewer"
+			rel := to[strings.Index(to, "#")+1:]
+			r.User = &UserRefObjectRelation{
+				ObjectRelation: &openfgav1.ObjectRelation{
+					Object:   sourceUserObj,
+					Relation: rel,
+				},
+			}
+			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			if err != nil {
+				errs = errors.Join(errs, err)
+				return errs
+			}
+		case weightedGraph.TTUEdge:
+			pool.Go(func(ctx context.Context) error {
+				return c.reverseExpandTupleToUserset(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			})
+		case weightedGraph.RewriteEdge:
+			fmt.Printf("JUSTIN Rewrite edge from %s to %s\n", edge.GetFrom().GetUniqueLabel(), edge.GetTo().GetUniqueLabel())
+			// this'll need a dispatch with a new key, instead of "type#rel" it'll be "exclusion:01JVWQXTZYP578BTN93PR9JTQK"
+			// or intersection
+		default:
+			fmt.Printf("Unknown edge type %d\n", edge.GetEdgeType())
+			panic("unsupported edge type")
+		}
+	}
+
+	return errors.Join(errs, pool.Wait())
+	// Can we lift this to the caller? I don't want to have to pass in a span also this method signature is big
+	// if errs != nil {
+	//	telemetry.TraceError(span, errs)
+	//	return errs
+	//}
 }
 
 func hasPathTo(dest string) func(*weightedGraph.WeightedAuthorizationModelEdge) bool {
