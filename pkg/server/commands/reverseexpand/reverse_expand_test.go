@@ -592,6 +592,9 @@ func TestReverseExpandThrottle(t *testing.T) {
 func TestReverseExpandDispatchCount(t *testing.T) {
 	ds := memory.New()
 	t.Cleanup(ds.Close)
+	t.Cleanup(func() {
+		goleak.VerifyNone(t)
+	})
 	tests := []struct {
 		name                    string
 		model                   string
@@ -736,6 +739,8 @@ func TestReverseExpandDispatchCount(t *testing.T) {
 					break ConsumerLoop
 				case <-ctx.Done():
 					break ConsumerLoop
+				case <-time.After(30 * time.Millisecond):
+					require.FailNow(t, "unexpected timeout on channel receive")
 				}
 			}
 			require.Equal(t, test.expectedDispatchCount, resolutionMetadata.DispatchCounter.Load())
