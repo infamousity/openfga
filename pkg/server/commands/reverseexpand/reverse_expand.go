@@ -444,6 +444,9 @@ func (c *ReverseExpandQuery) loopOverEdgesUsingWeigtedGraph(
 		return err
 	}
 
+	// if it's a userset and there no edges, just readTuplesAndExecuteWeighted with the type#rel
+	// and return
+
 	return c.LoopOverWeightedEdges(
 		ctx,
 		edges,

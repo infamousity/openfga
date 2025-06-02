@@ -174,7 +174,7 @@ condition xcond(x: string) {
 }`,
 
 	//Tests: slices.Concat(directs, usersets, ttus),
-	Tests: directs,
+	Tests: usersets,
 }
 
 func runTestMatrix(t *testing.T, params testParams) {
