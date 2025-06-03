@@ -339,11 +339,6 @@ func (c *ReverseExpandQuery) execute(
 	if c.listObjectOptimizationsEnabled {
 		wg := c.typesystem.GetWeightedGraph()
 		if wg != nil {
-			// TODO : remove, for debugging only
-			if _, ok := ctx.Value("WG").(*typesystem.TypeSystem); !ok {
-				ctx = context.WithValue(ctx, "WG", wg)
-			}
-
 			return c.loopOverEdgesUsingWeigtedGraph(ctx, req, resultChan, intersectionOrExclusionInPreviousEdges, resolutionMetadata, wg, sourceUserType, sourceUserObj)
 		}
 	}
@@ -510,7 +505,6 @@ func (c *ReverseExpandQuery) shouldCheckPublicAssignable(targetReference *openfg
 }
 
 func (c *ReverseExpandQuery) buildQueryFilters(
-	ctx context.Context,
 	req *ReverseExpandRequest,
 ) ([]*openfgav1.ObjectRelation, string, error) {
 	var userFilter []*openfgav1.ObjectRelation
@@ -581,7 +575,7 @@ func (c *ReverseExpandQuery) readTuplesAndExecute(
 	var userFilter []*openfgav1.ObjectRelation
 	var relationFilter string
 
-	userFilter, relationFilter, err := c.buildQueryFilters(ctx, req)
+	userFilter, relationFilter, err := c.buildQueryFilters(req)
 	if err != nil {
 		return err
 	}
