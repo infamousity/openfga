@@ -49,10 +49,23 @@ func (c *ReverseExpandQuery) loopOverEdgesUsingWeigtedGraph(
 		return err
 	}
 
-	// if it's a userset and there no edges, just readTuplesAndExecuteWeighted with the type#rel
-	// and return
-	if edges == nil || len(edges) == 0 {
-		return c.readTuplesAndExecuteWeighted(ctx, req, resultChan, intersectionOrExclusionInPreviousEdges, resolutionMetadata)
+	if len(edges) == 0 {
+		// If it's a userset and there no edges, that means this is the last relation for this branch.
+		// We can query based on the userset relation e.g. 'group:eng#member' and return
+		if _, ok := req.User.(*UserRefObjectRelation); ok {
+			node, _ := wg.GetNodeByID(targetTypeRel)
+			newEdges, _ := wg.GetEdgesFromNode(node)
+			println(newEdges)
+			// grab either edge, what we care about is the .From() so the destination does not matter
+			req.weightedEdge = newEdges[0]
+			return c.readTuplesAndExecuteWeighted(
+				ctx,
+				req,
+				resultChan,
+				intersectionOrExclusionInPreviousEdges,
+				resolutionMetadata,
+			)
+		}
 	}
 
 	return c.loopOverWeightedEdges(
@@ -87,9 +100,6 @@ func (c *ReverseExpandQuery) getEdgesFromWeightedGraph(
 	// This means we cannot reach the source type requested.
 	// e.g. there is no path from 'document' to 'user'
 	if _, ok = currentNode.GetWeight(sourceType); !ok {
-		if edges, ok := wg.GetEdgesFromNode(currentNode); ok {
-			return edges, needsCheck, nil
-		}
 		return nil, false, nil
 	}
 
@@ -147,9 +157,6 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 	var errs error
 
 	for _, edge := range edges {
-		// TODO: i think the getEdgesFromWeightedGraph func handles this for us, shouldn't need this
-		// intersectionOrExclusionInPreviousEdges := intersectionOrExclusionInPreviousEdges || innerLoopEdge.TargetReferenceInvolvesIntersectionOrExclusion
-		//innerLoopEdge := edge
 		r := &ReverseExpandRequest{
 			Consistency:      req.Consistency,
 			Context:          req.Context,
@@ -232,6 +239,7 @@ func (c *ReverseExpandQuery) reverseExpandDirectWeighted(
 		span.End()
 	}()
 
+	// Do we want to separate buildQueryFilters more, and feed it in below?
 	err = c.readTuplesAndExecuteWeighted(ctx, req, resultChan, intersectionOrExclusionInPreviousEdges, resolutionMetadata)
 	return err
 }
@@ -277,7 +285,7 @@ func (c *ReverseExpandQuery) readTuplesAndExecuteWeighted(
 	var userFilter []*openfgav1.ObjectRelation
 	var relationFilter string
 
-	userFilter, relationFilter, err := c.buildQueryFiltersWeighted(ctx, req)
+	userFilter, relationFilter, err := c.buildQueryFiltersWeighted(req)
 	if err != nil {
 		return err
 	}
@@ -347,8 +355,6 @@ LoopOnIterator:
 
 		switch req.weightedEdge.GetEdgeType() {
 		case weightedGraph.DirectEdge:
-			// for direct edge I think we can just emit this and be done
-			// need the "needs check" bit
 			err := c.trySendCandidate(ctx, intersectionOrExclusionInPreviousEdges, foundObject, resultChan)
 			errs = errors.Join(errs, err)
 
@@ -393,13 +399,20 @@ LoopOnIterator:
 	return nil
 }
 
-func (c *ReverseExpandQuery) buildQueryFiltersWeighted(
-	ctx context.Context,
-	req *ReverseExpandRequest,
-) ([]*openfgav1.ObjectRelation, string, error) {
+//func (c *ReverseExpandQuery) buildUsersetQueryFilters(req *ReverseExpandRequest) ([]*openfgav1.ObjectRelation, string, error) {
+//
+//}
+
+func (c *ReverseExpandQuery) buildQueryFiltersWeighted(req *ReverseExpandRequest) ([]*openfgav1.ObjectRelation, string, error) {
 	var userFilter []*openfgav1.ObjectRelation
 	var relationFilter string
 
+	// We really always need to have a weighted edge, maybe preload the first one at the start?
+	//if req.weightedEdge == nil {
+	//	if userSet, ok := req.User.(*UserRefObjectRelation); ok {
+	//		userFilter = append(userFilter, userSet.ObjectRelation)
+	//	}
+	//}
 	// Should this actually be looking at the node we're heading towards?
 	switch req.weightedEdge.GetEdgeType() {
 	case weightedGraph.DirectEdge:
@@ -444,7 +457,7 @@ func (c *ReverseExpandQuery) buildQueryFiltersWeighted(
 			//fmt.Printf("JUSTIN adding a relation piece: %s - node type: %d\n", val.ObjectRelation, toNode.GetNodeType())
 		}
 	case weightedGraph.TTUEdge:
-		relationFilter = req.edge.TuplesetRelation
+		relationFilter = req.edge.TuplesetRelation // This needs to be updated
 		// a TTU edge can only have a userset as a source node
 		// e.g. 'group:eng#member'
 		if val, ok := req.User.(*UserRefObjectRelation); ok {
