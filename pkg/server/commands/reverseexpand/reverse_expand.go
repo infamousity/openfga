@@ -416,48 +416,6 @@ LoopOnEdges:
 	return nil
 }
 
-func (c *ReverseExpandQuery) loopOverEdgesUsingWeigtedGraph(
-	ctx context.Context,
-	req *ReverseExpandRequest,
-	resultChan chan<- *ReverseExpandResult,
-	intersectionOrExclusionInPreviousEdges bool,
-	resolutionMetadata *ResolutionMetadata,
-	wg *weightedGraph.WeightedAuthorizationModelGraph,
-	sourceUserType, sourceUserObj string,
-) error {
-	targetTypeRel := req.weightedEdgeTypeRel
-	// This is true on the first call of reverse expand
-	if targetTypeRel == "" {
-		targetObjRef := typesystem.DirectRelationReference(req.ObjectType, req.Relation)
-
-		targetTypeRel = targetObjRef.GetType() + "#" + targetObjRef.GetRelation()
-	}
-
-	edges, needsCheck, err := c.getEdgesFromWeightedGraph(
-		wg,
-		targetTypeRel,
-		sourceUserType,
-		intersectionOrExclusionInPreviousEdges,
-	)
-
-	if err != nil {
-		return err
-	}
-
-	// if it's a userset and there no edges, just readTuplesAndExecuteWeighted with the type#rel
-	// and return
-
-	return c.LoopOverWeightedEdges(
-		ctx,
-		edges,
-		needsCheck,
-		req,
-		resolutionMetadata,
-		resultChan,
-		sourceUserObj,
-	)
-}
-
 func (c *ReverseExpandQuery) reverseExpandTupleToUserset(
 	ctx context.Context,
 	req *ReverseExpandRequest,
@@ -762,68 +720,4 @@ func (c *ReverseExpandQuery) throttle(ctx context.Context, currentNumDispatch ui
 		metadata.WasThrottled.Store(true)
 		c.dispatchThrottlerConfig.Throttler.Throttle(ctx)
 	}
-}
-
-// GetEdgesFromWeightedGraph returns a list of edges, boolean indicating whether Check is needed, and an error.
-func (c *ReverseExpandQuery) getEdgesFromWeightedGraph(
-	wg *weightedGraph.WeightedAuthorizationModelGraph,
-	targetTypeRelation string,
-	sourceType string,
-	needsCheck bool,
-) ([]*weightedGraph.WeightedAuthorizationModelEdge, bool, error) {
-	if wg == nil {
-		// this should never happen
-		return nil, false, errors.New("weighted graph is nil")
-	}
-
-	currentNode, ok := wg.GetNodeByID(targetTypeRelation)
-	if !ok {
-		// This should never happen
-		return nil, false, errors.New("currentNode is nil")
-	}
-
-	// This means we cannot reach the source type requested.
-	// e.g. there is no path from 'document' to 'user'
-	if _, ok = currentNode.GetWeight(sourceType); !ok {
-		return nil, false, nil
-	}
-
-	edges, _ := wg.GetEdgesFromNode(currentNode)
-
-	// TODO: this _shouldn't_ be reachable but will be dealt with in a follow up PR
-	// This would mean that we dispatched from a direct edge, which doesn't make sense
-	if len(edges) == 0 {
-		return nil, false, errors.New("no outgoing edges")
-	}
-
-	if currentNode.GetNodeType() == weightedGraph.OperatorNode {
-		switch currentNode.GetLabel() {
-		case weightedGraph.ExclusionOperator: // e.g. rel1: [user, other] BUT NOT b
-			butNotEdge := edges[len(edges)-1] // this is the edge to 'b'
-			_, canReachSource := butNotEdge.GetWeight(sourceType)
-
-			// if the 'b' in BUT NOT b has a weight for the terminal type we're seeking
-			// we need to run check at the end
-			if canReachSource {
-				needsCheck = true
-			}
-
-			// prune off the "BUT NOT b" portion of these edges and keep going
-			// the right-most edge is ALWAYS the "BUT NOT", so trim the last element
-			edges = edges[:len(edges)-1]
-		case weightedGraph.IntersectionOperator:
-			// For AND relations, mark as "needs check" and just pick the lowest weight edge
-			needsCheck = true
-
-			lowestWeightEdge := reduce(edges, nil, cheapestEdgeTo(sourceType))
-
-			// return only the lowest weight edge
-			edges = []*weightedGraph.WeightedAuthorizationModelEdge{lowestWeightEdge}
-		}
-	}
-
-	// Filter to only return edges which have a path to the sourceType
-	relevantEdges := filter(edges, hasPathTo(sourceType))
-
-	return relevantEdges, needsCheck, nil
 }
