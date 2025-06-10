@@ -12,6 +12,7 @@ import (
 	"github.com/openfga/openfga/internal/validation"
 	"github.com/openfga/openfga/pkg/storage"
 	"github.com/openfga/openfga/pkg/tuple"
+	"sync"
 )
 
 // relationStack is a stack of type#rel strings we build while traversing the graph to locate leaf nodes
@@ -167,124 +168,159 @@ func (c *ReverseExpandQuery) queryForTuples(
 	//	typeRel = req.stack.Pop()
 	//}
 
-	var userID string
-	var userType string
-	// We will always have a UserRefObject here. Queries that come in for pure usersets do not take this code path.
-	// e.g. ListObjects(team:fga#member, document, viewer) will not make it here.
-	if val, ok := req.User.(*UserRefObject); ok {
-		userType = val.GetObjectType()
-		userID = val.Object.GetId()
-	}
+	var wg sync.WaitGroup
+	errChan := make(chan error, 100) // random value here, needs tuning
 
-	to := req.weightedEdge.GetTo()
+	var queryFunc func(context.Context, *ReverseExpandRequest, string)
 
-	var typeRel string
-	var userFilter []*openfgav1.ObjectRelation
-	switch to.GetNodeType() {
-	case weightedGraph.SpecificType: // Direct User Reference. To() -> "user"
-		typeRel = req.stack.Pop()
-		userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: tuple.BuildObject(to.GetUniqueLabel(), userID)})
-
-	case weightedGraph.SpecificTypeWildcard: // Wildcard Referece To() -> "user:*"
-		typeRel = req.stack.Pop()
-		userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: to.GetUniqueLabel()})
-
-	case weightedGraph.SpecificTypeAndRelation: // Userset, To() -> "group#member"
-		typeRel = to.GetUniqueLabel()
-
-		// For this case, we can't build the ObjectRelation with the To() from the edge, because it doesn't
-		// Point at an actual type like "user". So we have to use the userType from the original request
-		// to determine whether the requested user is a member of this userset
-		userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: tuple.BuildObject(userType, userID)})
-	}
-
-	objectType, relation := tuple.SplitObjectRelation(typeRel)
-	fmt.Printf("JUSTIN querying: \n\tUserfilter: %s, relation: %s, objectType: %s\n",
-		userFilter, relation, objectType,
-	)
-	iter, err := c.datastore.ReadStartingWithUser(ctx, req.StoreID, storage.ReadStartingWithUserFilter{
-		ObjectType: objectType,
-		Relation:   relation,
-		UserFilter: userFilter,
-	}, storage.ReadStartingWithUserOptions{
-		Consistency: storage.ConsistencyOptions{
-			Preference: req.Consistency,
-		},
-	})
-	if err != nil {
-		return err
-	}
-
-	// filter out invalid tuples yielded by the database iterator
-	filteredIter := storage.NewFilteredTupleKeyIterator(
-		storage.NewTupleKeyIteratorFromTupleIterator(iter),
-		validation.FilterInvalidTuples(c.typesystem),
-	)
-	defer filteredIter.Stop()
-
-	var errs error
-	// maybe LoopOnIterator is the part that actually needs to be recursive or callable in a loop
-LoopOnIterator:
-	for {
-		tk, err := filteredIter.Next(ctx)
-		if err != nil {
-			if errors.Is(err, storage.ErrIteratorDone) {
-				break
-			}
-			errs = errors.Join(errs, err)
-			break LoopOnIterator
-		}
-		fmt.Printf("JUSTIN TK FOUND: %s\n", tk.String())
-
-		condEvalResult, err := eval.EvaluateTupleCondition(ctx, tk, c.typesystem, req.Context)
-		if err != nil {
-			errs = errors.Join(errs, err)
-			continue
+	queryFunc = func(qCtx context.Context, r *ReverseExpandRequest, objectOverride string) {
+		defer wg.Done()
+		if qCtx.Err() != nil {
+			return
 		}
 
-		if !condEvalResult.ConditionMet {
-			if len(condEvalResult.MissingParameters) > 0 {
-				errs = errors.Join(errs, condition.NewEvaluationError(
-					tk.GetCondition().GetName(),
-					fmt.Errorf("tuple '%s' is missing context parameters '%v'",
-						tuple.TupleKeyToString(tk),
-						condEvalResult.MissingParameters),
-				))
-			}
-
-			continue
-		}
-		//fmt.Printf("JUSTIN TK passed conditions: %s\n", tk.String())
-		if req.stack.Len() == 0 {
-			_ = c.trySendCandidate(ctx, needsCheck, tk.GetObject(), resultChan)
-			continue
+		var typeRel string
+		var userFilter []*openfgav1.ObjectRelation
+		// this is true on every call Except the first
+		if objectOverride != "" {
+			typeRel = r.stack.Pop()
+			userFilter = append(userFilter, &openfgav1.ObjectRelation{
+				Object: objectOverride,
+			})
 		} else {
-			// trigger query for tuples all over again
-			fmt.Println("Recursion")
-			foundObject := tk.GetObject()
-
-			// now we create a fake WG edge to make this work recursively
-			// all fields are private and there's no New method
-			toNode := weightedGraph.WeightedAuthorizationModelNode{
-				nodeType: weightedGraph.SpecificType,
+			var userID string
+			var userType string
+			// We will always have a UserRefObject here. Queries that come in for pure usersets do not take this code path.
+			// e.g. ListObjects(team:fga#member, document, viewer) will not make it here.
+			if val, ok := req.User.(*UserRefObject); ok {
+				userType = val.GetObjectType()
+				userID = val.Object.GetId()
 			}
-			// so now we need to query this object against the last stack type#rel
-			// e.g. organization:jz#member@user:justin
-			// now we need organization:jz
 
-			// another option is to create a new channel here, and have the queries run in loops below,
-			// emitting to a channel which then triggers more queries
+			to := req.weightedEdge.GetTo()
 
-			// could just do a for loop here
-			// for ; stack.Len() > 0 && objectFromQueryStillExists {}
+			switch to.GetNodeType() {
+			case weightedGraph.SpecificType: // Direct User Reference. To() -> "user"
+				typeRel = req.stack.Pop()
+				userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: tuple.BuildObject(to.GetUniqueLabel(), userID)})
 
-			//c.queryForTuples(ctx, req, needsCheck, resultChan)
-			// queryForTuples()
-			// new object we just found
-			// stack with 1 less element
+			case weightedGraph.SpecificTypeWildcard: // Wildcard Referece To() -> "user:*"
+				typeRel = req.stack.Pop()
+				userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: to.GetUniqueLabel()})
+
+			case weightedGraph.SpecificTypeAndRelation: // Userset, To() -> "group#member"
+				typeRel = to.GetUniqueLabel()
+
+				// For this case, we can't build the ObjectRelation with the To() from the edge, because it doesn't
+				// Point at an actual type like "user". So we have to use the userType from the original request
+				// to determine whether the requested user is a member of this userset
+				userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: tuple.BuildObject(userType, userID)})
+			}
+		}
+
+		objectType, relation := tuple.SplitObjectRelation(typeRel)
+		fmt.Printf("JUSTIN querying: \n\tUserfilter: %s, relation: %s, objectType: %s\n",
+			userFilter, relation, objectType,
+		)
+		iter, err := c.datastore.ReadStartingWithUser(ctx, req.StoreID, storage.ReadStartingWithUserFilter{
+			ObjectType: objectType,
+			Relation:   relation,
+			UserFilter: userFilter,
+		}, storage.ReadStartingWithUserOptions{
+			Consistency: storage.ConsistencyOptions{
+				Preference: req.Consistency,
+			},
+		})
+
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		// filter out invalid tuples yielded by the database iterator
+		filteredIter := storage.NewFilteredTupleKeyIterator(
+			storage.NewTupleKeyIteratorFromTupleIterator(iter),
+			validation.FilterInvalidTuples(c.typesystem),
+		)
+		defer filteredIter.Stop()
+
+	LoopOnIterator:
+		for {
+			tk, err := filteredIter.Next(ctx)
+			if err != nil {
+				if !errors.Is(err, storage.ErrIteratorDone) {
+					break
+				}
+				errChan <- err
+				break LoopOnIterator
+			}
+			fmt.Printf("JUSTIN TK FOUND: %s\n", tk.String())
+
+			condEvalResult, err := eval.EvaluateTupleCondition(ctx, tk, c.typesystem, req.Context)
+			if err != nil {
+				errChan <- err
+				continue
+			}
+
+			if !condEvalResult.ConditionMet {
+				if len(condEvalResult.MissingParameters) > 0 {
+					errChan <- condition.NewEvaluationError(
+						tk.GetCondition().GetName(),
+						fmt.Errorf("tuple '%s' is missing context parameters '%v'",
+							tuple.TupleKeyToString(tk),
+							condEvalResult.MissingParameters),
+					)
+				}
+
+				continue
+			}
+			//fmt.Printf("JUSTIN TK passed conditions: %s\n", tk.String())
+			if r.stack.Len() == 0 {
+				_ = c.trySendCandidate(ctx, needsCheck, tk.GetObject(), resultChan)
+				continue
+			} else {
+				// trigger query for tuples all over again
+				fmt.Println("Recursion")
+				foundObject := tk.GetObject() // This will be a "type:id" e.g. "document:roadmap"
+
+				newReq := &ReverseExpandRequest{
+					StoreID:          r.StoreID,
+					Consistency:      r.Consistency,
+					Context:          r.Context,
+					ContextualTuples: r.ContextualTuples,
+					User:             r.User,
+					stack:            r.stack.Copy(),
+					weightedEdge:     r.weightedEdge, // Inherited but not used by the override path
+				}
+
+				wg.Add(1)
+				go queryFunc(qCtx, newReq, foundObject)
+				// so now we need to query this object against the last stack type#rel
+				// e.g. organization:jz#member@user:justin
+				// now we need organization:jz
+
+				// could just do a for loop here
+				// for ; stack.Len() > 0 && objectFromQueryStillExists {}
+
+				//c.queryForTuples(ctx, req, needsCheck, resultChan)
+				// queryForTuples()
+				// new object we just found
+				// stack with 1 less element
+			}
 		}
 	}
 
+	// Now kick off the querying without an explicit object override for the first call
+	wg.Add(1)
+	go queryFunc(ctx, req, "")
+
+	wg.Wait()
+	close(errChan)
+	close(resultChan)
+	var errs error
+	for err := range errChan {
+		errs = errors.Join(errs, err)
+	}
 	return errs
 }
 
