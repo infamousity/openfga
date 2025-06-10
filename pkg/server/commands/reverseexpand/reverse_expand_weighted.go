@@ -4,19 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/openfga/openfga/internal/condition"
-	"github.com/openfga/openfga/internal/condition/eval"
-
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	weightedGraph "github.com/openfga/language/pkg/go/graph"
-
 	"github.com/openfga/openfga/internal/concurrency"
+	"github.com/openfga/openfga/internal/condition"
+	"github.com/openfga/openfga/internal/condition/eval"
 	"github.com/openfga/openfga/internal/validation"
 	"github.com/openfga/openfga/pkg/storage"
 	"github.com/openfga/openfga/pkg/tuple"
 )
 
-// This might be better-implemented with pointers for memory's sake.
+// relationStack is a stack of type#rel strings we build while traversing the graph to locate leaf nodes
 type relationStack []string
 
 func (r *relationStack) Push(value string) {
@@ -67,8 +65,18 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			edge:                req.edge,
 			stack:               req.stack.Copy(),
 		}
+		fmt.Printf("Justin Edge: %s --> %s Stack: %s\n",
+			edge.GetFrom().GetUniqueLabel(),
+			edge.GetTo().GetUniqueLabel(),
+			r.stack.Copy(),
+		)
 		switch edge.GetEdgeType() {
 		case weightedGraph.DirectEdge:
+			fmt.Printf("Justin Direct Edge: \n\t%s\n\t%s\n\t%s\n",
+				edge.GetFrom().GetUniqueLabel(),
+				edge.GetTo().GetUniqueLabel(),
+				r.stack.Copy(),
+			)
 			// Now kick off queries for tuples based on the stack of relations we have built to get to this leaf
 			pool.Go(func(ctx context.Context) error {
 				return c.queryForTuples(
@@ -92,9 +100,29 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				return errs
 			}
 		case weightedGraph.TTUEdge: // This is not handled yet
-			panic("not implemented yet")
-			// pool.Go(func(ctx context.Context) error {
-			//	return c.reverseExpandTupleToUsersetWeighted(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			fmt.Printf("Justin TTU Edge: \n\t%s\n\t%s\n\t%s\n",
+				edge.GetFrom().GetUniqueLabel(),
+				edge.GetTo().GetUniqueLabel(),
+				r.stack.Copy(),
+			)
+			if edge.GetTo().GetNodeType() != weightedGraph.OperatorNode {
+				// Replace the existing type#rel on the stack with the TTU relation
+				_ = r.stack.Pop()
+				r.stack.Push(edge.GetTuplesetRelation())
+				r.stack.Push(edge.GetTo().GetUniqueLabel())
+			}
+			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			if err != nil {
+				errs = errors.Join(errs, err)
+				return errs
+			}
+			//pool.Go(func(ctx context.Context) error {
+			//	return c.queryForTuples(
+			//		ctx,
+			//		r,
+			//		needsCheck,
+			//		resultChan, // can we put this on the ReverseExpandQuery itself?
+			//	)
 			//})
 		case weightedGraph.RewriteEdge:
 			// bc operator nodes are not real types
@@ -127,32 +155,53 @@ func (c *ReverseExpandQuery) queryForTuples(
 	// copying the whole ReverseExpandRequest like we do everywhere else
 	// TODO: don't forget telemetry
 
-	typeRel := req.stack.Pop()
-	to := req.weightedEdge.GetTo()
+	// Direct edges after TTUs can come in looking like this, with the To of a userset
+	//	Justin Direct Edge:
+	//	organization#repo_admin // From()
+	//	organization#member // This was the To(). So in this case we'd need to NOT pop from the stack and query for
+	//	[repo#owner]		// organizations this user is a member of right off the bat, then use the stack
+
+	//if to.GetNodeType() != weightedGraph.SpecificTypeAndRelation {
+	//	typeRel = to.GetUniqueLabel()
+	//} else {
+	//	typeRel = req.stack.Pop()
+	//}
+
 	var userID string
+	var userType string
+	// We will always have a UserRefObject here. Queries that come in for pure usersets do not take this code path.
+	// e.g. ListObjects(team:fga#member, document, viewer) will not make it here.
 	if val, ok := req.User.(*UserRefObject); ok {
+		userType = val.GetObjectType()
 		userID = val.Object.GetId()
 	}
-	// build iterator
-	// loop over iterator
-	//   for each result
-	//      if stack is empty: send to result channel and return
-	//      if stack not empty: copy the stack and call this method again with the new result as the object
-	// c.buildFiltersV2(req)
 
+	to := req.weightedEdge.GetTo()
+
+	var typeRel string
 	var userFilter []*openfgav1.ObjectRelation
 	switch to.GetNodeType() {
-	case weightedGraph.SpecificType:
-		// Direct user reference
+	case weightedGraph.SpecificType: // Direct User Reference. To() -> "user"
+		typeRel = req.stack.Pop()
 		userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: tuple.BuildObject(to.GetUniqueLabel(), userID)})
-	case weightedGraph.SpecificTypeWildcard:
-		// The label on wildcard leaf nodes is formatted as "type:*" e.g. "user:*"
+
+	case weightedGraph.SpecificTypeWildcard: // Wildcard Referece To() -> "user:*"
+		typeRel = req.stack.Pop()
 		userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: to.GetUniqueLabel()})
-	case weightedGraph.SpecificTypeAndRelation:
-		panic("not implemented yet")
+
+	case weightedGraph.SpecificTypeAndRelation: // Userset, To() -> "group#member"
+		typeRel = to.GetUniqueLabel()
+
+		// For this case, we can't build the ObjectRelation with the To() from the edge, because it doesn't
+		// Point at an actual type like "user". So we have to use the userType from the original request
+		// to determine whether the requested user is a member of this userset
+		userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: tuple.BuildObject(userType, userID)})
 	}
 
 	objectType, relation := tuple.SplitObjectRelation(typeRel)
+	fmt.Printf("JUSTIN querying: \n\tUserfilter: %s, relation: %s, objectType: %s\n",
+		userFilter, relation, objectType,
+	)
 	iter, err := c.datastore.ReadStartingWithUser(ctx, req.StoreID, storage.ReadStartingWithUserFilter{
 		ObjectType: objectType,
 		Relation:   relation,
@@ -174,6 +223,7 @@ func (c *ReverseExpandQuery) queryForTuples(
 	defer filteredIter.Stop()
 
 	var errs error
+	// maybe LoopOnIterator is the part that actually needs to be recursive or callable in a loop
 LoopOnIterator:
 	for {
 		tk, err := filteredIter.Next(ctx)
@@ -184,6 +234,7 @@ LoopOnIterator:
 			errs = errors.Join(errs, err)
 			break LoopOnIterator
 		}
+		fmt.Printf("JUSTIN TK FOUND: %s\n", tk.String())
 
 		condEvalResult, err := eval.EvaluateTupleCondition(ctx, tk, c.typesystem, req.Context)
 		if err != nil {
@@ -203,13 +254,30 @@ LoopOnIterator:
 
 			continue
 		}
-		fmt.Printf("JUSTIN TK FOUND: %s\n", tk.String())
+		//fmt.Printf("JUSTIN TK passed conditions: %s\n", tk.String())
 		if req.stack.Len() == 0 {
 			_ = c.trySendCandidate(ctx, needsCheck, tk.GetObject(), resultChan)
 			continue
 		} else {
 			// trigger query for tuples all over again
 			fmt.Println("Recursion")
+			foundObject := tk.GetObject()
+
+			// now we create a fake WG edge to make this work recursively
+			// all fields are private and there's no New method
+			toNode := weightedGraph.WeightedAuthorizationModelNode{
+				nodeType: weightedGraph.SpecificType,
+			}
+			// so now we need to query this object against the last stack type#rel
+			// e.g. organization:jz#member@user:justin
+			// now we need organization:jz
+
+			// another option is to create a new channel here, and have the queries run in loops below,
+			// emitting to a channel which then triggers more queries
+
+			// could just do a for loop here
+			// for ; stack.Len() > 0 && objectFromQueryStillExists {}
+
 			//c.queryForTuples(ctx, req, needsCheck, resultChan)
 			// queryForTuples()
 			// new object we just found
@@ -219,6 +287,8 @@ LoopOnIterator:
 
 	return errs
 }
+
+//func queryWhileWeCan(stack relationStack, typeRel string, object string)
 
 // func (c *ReverseExpandQuery) buildFiltersV2(
 //
