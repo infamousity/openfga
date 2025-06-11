@@ -268,7 +268,18 @@ func (c *ReverseExpandQuery) queryForTuples(
 			case weightedGraph.SpecificTypeAndRelation: // Userset, To() -> "group#member"
 				typeRel = to.GetUniqueLabel()
 
-				// Hack to prove it's possible, add explainer if this works
+				// For a terminal userset edge, we need to attach an additional relation to the last
+				// element in the stack.
+				//
+				// Using this model as an example:
+				//	  type organization
+				//		define repo_admin: [team#member]
+				//
+				// To resolve organization#repo_admin above for user:bob, we first have to see if user:bob is a member of any teams.
+				// If we find this tuple: team:fga#member@user:bob, subsequent recursive calls of this method need to know
+				// to append the #member relation when querying further. Without it, the query isn't meaningful, there cannot be
+				// tuples of the form "organization#repo_admin@team:fga", that isn't valid in this model.
+				// We must append #member to the 'user' in the subsequent query, so it becomes: "organization#repo_admin@team:fga#member".
 				relation := tuple.GetRelation(typeRel)
 				req.stack[len(req.stack)-1].usersetRelation = relation
 
