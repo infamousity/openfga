@@ -97,8 +97,22 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			r.stack.Copy(),
 		)
 		toNode := edge.GetTo()
+
+		// combination of From() and To() for usersets should fix the infinite looping issue
+		if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
+			key := edge.GetFrom().GetUniqueLabel() + toNode.GetUniqueLabel()
+			if _, loaded := c.visitedUsersetsMap.LoadOrStore(key, struct{}{}); loaded {
+				// we've already visited this userset through this edge, exit to avoid an infinite cycle
+				wt, _ := edge.GetWeight("user")
+				fmt.Printf("JUSTIN WEIGHT INF: %t\n", wt == weightedGraph.Infinite)
+				fmt.Println("ABORTING INFINITE LOOP")
+				continue
+			}
+		}
+
 		switch edge.GetEdgeType() {
 		case weightedGraph.DirectEdge:
+			// TODO: maybe for direct edges which point to usersets we should be continuing the traversal
 			fmt.Printf("Justin Direct Edge: \n\t%s\n\t%s\n\t%s\n",
 				edge.GetFrom().GetUniqueLabel(),
 				toNode.GetUniqueLabel(),
@@ -138,6 +152,15 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				r.stack.Push(typeRelEntry{typeRel: edge.GetTuplesetRelation()})
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 			}
+			// TODO: I think we can determine whether it's recursive here, and if it is we should indicate that
+			// on the stack for this branch somehow. Maybe for those cases we trigger two additional jobs if we find a result
+			// one for the recursive relation and one with the stack modified to continue up the chain
+			// It would just continually loop over the #parent or whatever relationship until it stopped finding tuples
+			// All recursive nodes are basically terminal nodes, since there's no escape, so just query and emit all findings
+			// until we run out. will require adjustment in the final query block
+			// if we still have stack:
+			//		if this is recursive:
+			//			trySendCandidate anyway, and then retrigger with the same relation again forever, until we stop finding tuples
 			fmt.Printf("Justin TTU Edge after: \n\t%s\n\t%s\n\t%s\n",
 				edge.GetFrom().GetUniqueLabel(),
 				toNode.GetUniqueLabel(),
