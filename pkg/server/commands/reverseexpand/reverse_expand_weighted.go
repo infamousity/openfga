@@ -44,9 +44,11 @@ func (r *relationStack) Copy() []typeRelEntry {
 	return dst
 }
 
-// loopOverWeightedEdges iterates over a set of weightedGraphEdges that can resolve a particular
-// object-relation pair. It acts as a dispatcher, processing each edge according to its type to continue the
-// reverse expansion process. It will continue to dispatch and traverse the graph until it reaches a DirectEdge, which
+// loopOverWeightedEdges iterates over a set of weightedGraphEdges and acts as a dispatcher,
+// processing each edge according to its type to continue the reverse expansion process.
+//
+// While traversing, loopOverWeightedEdges appends relation entries to a stack for use in querying after traversal is complete.
+// It will continue to dispatch and traverse the graph until it reaches a DirectEdge, which
 // leads to a leaf node in the authorization graph. Once a DirectEdge is found, loopOverWeightedEdges invokes
 // queryForTuples, passing it the stack of relations it constructed on the way to that particular leaf.
 //
@@ -55,18 +57,13 @@ func (r *relationStack) Copy() []typeRelEntry {
 //
 // The behavior is determined by the edge type:
 //
-//   - DirectEdge: This represents a direct path to data. The function initiates a concurrent
-//     `queryForTuples` call to query the datastore for tuples that match the relationship path
-//     accumulated in the stack. This is a terminal path in the graph traversal.
+//   - DirectEdge: This represents a direct path to data. Here we initiate a call to
+//     `queryForTuples` to query the datastore for tuples that match the relationship path
+//     accumulated in the stack. This is the end of the traversal.
 //
 //   - ComputedEdge, RewriteEdge, and TTUEdge: These represent indirections in the authorization model.
 //     The function modifies the traversal 'stack' to reflect the next relationship that needs to be resolved.
-//     For example, for a TTU (Tuple-to-Userset) edge, it pushes both the tupleset relation and the
-//     target userset onto the stack. It then recursively calls `dispatch` to continue resolving the
-//     model with this new state until it reaches a DirectEdge.
-//
-// The function uses a concurrency pool to execute the `queryForTuples` calls in parallel,
-// and it aggregates any errors encountered during the dispatch or querying phases.
+//     It then calls `dispatch` to continue traversing the graph with this new state until it reaches a DirectEdge.
 func (c *ReverseExpandQuery) loopOverWeightedEdges(
 	ctx context.Context,
 	edges []*weightedGraph.WeightedAuthorizationModelEdge,
@@ -121,12 +118,7 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			// and prevent infinite loops. need to rebuild that loop prevention with weighted graph data.
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				_ = r.stack.Pop()
-				//newEntry := typeRelEntry{typeRel: edge.GetTo().GetUniqueLabel()}
-				//r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
-				if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
-					fmt.Printf("JUSTIN computed edge going to USERSET: %s\n", toNode.GetUniqueLabel())
-					//newEntry.usersetRelation
-				}
+				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 			}
 
 			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
@@ -145,9 +137,6 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				_ = r.stack.Pop()
 				r.stack.Push(typeRelEntry{typeRel: edge.GetTuplesetRelation()})
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
-				if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
-					fmt.Printf("JUSTIN TTU edge going to USERSET: %s\n", toNode.GetUniqueLabel())
-				}
 			}
 			fmt.Printf("Justin TTU Edge after: \n\t%s\n\t%s\n\t%s\n",
 				edge.GetFrom().GetUniqueLabel(),
@@ -164,9 +153,6 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				_ = r.stack.Pop()
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
-				if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
-					fmt.Printf("JUSTIN REWRITE edge going to USERSET: %s\n", toNode.GetUniqueLabel())
-				}
 			}
 			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
 			if err != nil {
@@ -181,25 +167,39 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 	return errors.Join(errs, pool.Wait())
 }
 
-// queryForTuples performs the core logic of the reverse expansion. After a leaf node has been found in loopOverWeightedEdges,
+// queryForTuples performs all datastore-related reverse expansion logic. After a leaf node has been found in loopOverWeightedEdges,
 // this function works backwards from a specified user (using the stack created in loopOverWeightedEdges)
 // and an initial relationship edge to find all the objects that the given user has the given relationship with.
-//
 // The function defines a recursive inner function, `queryFunc`, which is executed concurrently for different
 // branches of the relationship graph.
 //
 // On its initial execution, it constructs a database query filter based on the starting user and the "To"
 // part of the initial DirectEdge, which can be a direct user, a wildcard user, or a userset.
+// In subsequent recursive calls, it takes a `foundObject`—the object found in the previous step—and
+// that foundObject becomes the 'user' in the next query in the stack. Take this model for example:
 //
-// In subsequent recursive calls, it takes an `objectOverride`—the object found in the previous step—and
-// pops the next relation from the stack. It then queries for tuples where the `objectOverride` is the user,
-// effectively continuing the traversal up the graph.
+//		type user
+//		type organization
+//		  relations
+//			define member: [user]
+//			define repo_admin: [organization#member]
+//		type repo
+//		  relations
+//	        define admin: repo_admin from owner
+//	        define owner: [organization]
 //
-// For each tuple found from the datastore, it:
-// 1. Filters out any invalid tuples based on the type system.
-// 2. Evaluates any conditions associated with the tuple.
-// 3. If the relation stack is empty (the base case), the object from the tuple is a potential result and is sent to the result channel.
-// 4. If the relation stack is not empty (the recursive step), it spawns a new goroutine to continue querying with the found object.
+// When searching for repos which user:bob has #admin relation to, queryFunc behaves like so:
+//
+//  1. Search for organizations where user:bob is a member. We find this tuple: organization:fga#member@user:bob
+//  2. Take that foundObject, `organization:fga` and pass it to the next call of queryFunc.
+//  3. Query for tuples matching `organization#repo_admin@organization:fga#member` (because this is a userset relation).
+//  4. If we found another object in step 3, pass that into the next queryFunc call to be evaluated against the next element in the stack.
+//
+// We continue doing this recursively until we hit one of the two cases below:
+//
+//  1. We cannot locate a tuple for a query—this means this branch of the tree yielded no results.
+//  2. The stack is empty—this means there are no more queries to run, and this object is a candidate to be returned
+//     to ListObjects through resultChan.
 func (c *ReverseExpandQuery) queryForTuples(
 	ctx context.Context,
 	req *ReverseExpandRequest,
@@ -207,25 +207,12 @@ func (c *ReverseExpandQuery) queryForTuples(
 	resultChan chan<- *ReverseExpandResult,
 ) error {
 	// TODO: don't forget telemetry
-
-	// Direct edges after TTUs can come in looking like this, with the To of a userset
-	//	Justin Direct Edge:
-	//	organization#repo_admin // From()
-	//	organization#member // This was the To(). So in this case we'd need to NOT pop from the stack and query for
-	//	[repo#owner]		// organizations this user is a member of right off the bat, then use the stack
-
-	//if to.GetNodeType() != weightedGraph.SpecificTypeAndRelation {
-	//	typeRel = to.GetUniqueLabel()
-	//} else {
-	//	typeRel = req.stack.Pop()
-	//}
-
 	var wg sync.WaitGroup
-	errChan := make(chan error, 100) // random value here, needs tuning
+	errChan := make(chan error, 100) // TODO: random value here, needs tuning
 
 	var queryFunc func(context.Context, *ReverseExpandRequest, string)
 
-	queryFunc = func(qCtx context.Context, r *ReverseExpandRequest, objectOverride string) {
+	queryFunc = func(qCtx context.Context, r *ReverseExpandRequest, foundObject string) {
 		defer wg.Done()
 		if qCtx.Err() != nil {
 			return
@@ -235,10 +222,10 @@ func (c *ReverseExpandQuery) queryForTuples(
 		var userFilter []*openfgav1.ObjectRelation
 
 		// This is true on every call except the first
-		if objectOverride != "" {
+		if foundObject != "" {
 			entry := r.stack.Pop()
 			typeRel = entry.typeRel
-			filter := &openfgav1.ObjectRelation{Object: objectOverride}
+			filter := &openfgav1.ObjectRelation{Object: foundObject}
 			if entry.usersetRelation != "" {
 				filter.Relation = entry.usersetRelation
 			}
