@@ -15,6 +15,8 @@ import (
 	"sync"
 )
 
+// TODO: this stack might need to be a stack of UserRefObject or UserRefObjectRelation or something
+// to be able to handle usersets and TTUs properly
 // relationStack is a stack of type#rel strings we build while traversing the graph to locate leaf nodes
 type relationStack []string
 
@@ -93,11 +95,12 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			edge.GetTo().GetUniqueLabel(),
 			r.stack.Copy(),
 		)
+		toNode := edge.GetTo()
 		switch edge.GetEdgeType() {
 		case weightedGraph.DirectEdge:
 			fmt.Printf("Justin Direct Edge: \n\t%s\n\t%s\n\t%s\n",
 				edge.GetFrom().GetUniqueLabel(),
-				edge.GetTo().GetUniqueLabel(),
+				toNode.GetUniqueLabel(),
 				r.stack.Copy(),
 			)
 			// Now kick off queries for tuples based on the stack of relations we have built to get to this leaf
@@ -112,9 +115,12 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 		case weightedGraph.ComputedEdge:
 			// TODO: removed logic in here that transformed the usersets to trigger bail out case
 			// and prevent infinite loops. need to rebuild that loop prevention with weighted graph data.
-			if edge.GetTo().GetNodeType() != weightedGraph.OperatorNode {
+			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				_ = r.stack.Pop()
-				r.stack.Push(edge.GetTo().GetUniqueLabel())
+				r.stack.Push(toNode.GetUniqueLabel())
+				if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
+					fmt.Printf("JUSTIN computed edge going to USERSET: %s\n", toNode.GetUniqueLabel())
+				}
 			}
 
 			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
@@ -125,18 +131,21 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 		case weightedGraph.TTUEdge:
 			fmt.Printf("Justin TTU Edge before: \n\t%s\n\t%s\n\t%s\n",
 				edge.GetFrom().GetUniqueLabel(),
-				edge.GetTo().GetUniqueLabel(),
+				toNode.GetUniqueLabel(),
 				r.stack.Copy(),
 			)
-			if edge.GetTo().GetNodeType() != weightedGraph.OperatorNode {
+			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				// Replace the existing type#rel on the stack with the TTU relation
 				_ = r.stack.Pop()
 				r.stack.Push(edge.GetTuplesetRelation())
-				r.stack.Push(edge.GetTo().GetUniqueLabel())
+				r.stack.Push(toNode.GetUniqueLabel())
+				if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
+					fmt.Printf("JUSTIN TTU edge going to USERSET: %s\n", toNode.GetUniqueLabel())
+				}
 			}
 			fmt.Printf("Justin TTU Edge after: \n\t%s\n\t%s\n\t%s\n",
 				edge.GetFrom().GetUniqueLabel(),
-				edge.GetTo().GetUniqueLabel(),
+				toNode.GetUniqueLabel(),
 				r.stack.Copy(),
 			)
 			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
@@ -146,9 +155,12 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			}
 		case weightedGraph.RewriteEdge:
 			// bc operator nodes are not real types
-			if edge.GetTo().GetNodeType() != weightedGraph.OperatorNode {
+			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				_ = r.stack.Pop()
-				r.stack.Push(edge.GetTo().GetUniqueLabel())
+				r.stack.Push(toNode.GetUniqueLabel())
+				if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
+					fmt.Printf("JUSTIN REWRITE edge going to USERSET: %s\n", toNode.GetUniqueLabel())
+				}
 			}
 			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
 			if err != nil {
