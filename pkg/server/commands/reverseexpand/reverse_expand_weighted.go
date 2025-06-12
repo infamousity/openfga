@@ -9,10 +9,12 @@ import (
 	"github.com/openfga/openfga/internal/concurrency"
 	"github.com/openfga/openfga/internal/condition"
 	"github.com/openfga/openfga/internal/condition/eval"
+	"github.com/openfga/openfga/internal/utils"
 	"github.com/openfga/openfga/internal/validation"
 	"github.com/openfga/openfga/pkg/storage"
 	"github.com/openfga/openfga/pkg/tuple"
 	"sync"
+	"sync/atomic"
 )
 
 type typeRelEntry struct {
@@ -134,8 +136,6 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				)
 			})
 		case weightedGraph.ComputedEdge:
-			// TODO: removed logic in here that transformed the usersets to trigger bail out case
-			// and prevent infinite loops. need to rebuild that loop prevention with weighted graph data.
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				_ = r.stack.Pop()
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
@@ -251,7 +251,7 @@ func (c *ReverseExpandQuery) queryForTuples(
 
 	// This map has to live in this scope, as each leaf kicks off its own queries
 	// TODO: but what about leafs of the same branch, we could end up doing a bunch of duplicate work
-	jobDedupeMap := new(sync.Map)
+	//jobDedupeMap := new(sync.Map)
 	var queryFunc func(context.Context, *ReverseExpandRequest, string)
 	numJobs := atomic.Int32{} // TODO: remove, this is for debugging
 	queryFunc = func(qCtx context.Context, r *ReverseExpandRequest, foundObject string) {
@@ -332,14 +332,14 @@ func (c *ReverseExpandQuery) queryForTuples(
 
 		// TODO working on getting a unique key for this query
 		// so we can bail out of duplicate work earlier
-		key := utils.Reduce(userFilter, "", func(accumulator string, current *openfgav1.ObjectRelation) string {
-			return current.String() + accumulator
-		})
-		key += relation + objectType
-		if _, loaded := jobDedupeMap.LoadOrStore(key, struct{}{}); loaded {
-			fmt.Println("This query was already run, bailing")
-			return
-		}
+		//key := utils.Reduce(userFilter, "", func(accumulator string, current *openfgav1.ObjectRelation) string {
+		//	return current.String() + accumulator
+		//})
+		//key += relation + objectType
+		//if _, loaded := jobDedupeMap.LoadOrStore(key, struct{}{}); loaded {
+		//	fmt.Println("This query was already run, bailing")
+		//	return
+		//}
 
 		iter, err := c.datastore.ReadStartingWithUser(ctx, req.StoreID, storage.ReadStartingWithUserFilter{
 			ObjectType: objectType,
