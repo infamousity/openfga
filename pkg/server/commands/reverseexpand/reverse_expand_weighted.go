@@ -25,8 +25,7 @@ type typeRelEntry struct {
 	isRecursive bool
 }
 
-// TODO: this stack might need to be a stack of UserRefObject or UserRefObjectRelation or something
-// to be able to handle usersets and TTUs properly
+// TODO: update this comment
 // relationStack is a stack of type#rel strings we build while traversing the graph to locate leaf nodes
 type relationStack []typeRelEntry
 
@@ -79,7 +78,7 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 	resolutionMetadata *ResolutionMetadata,
 	resultChan chan<- *ReverseExpandResult,
 ) error {
-	pool := concurrency.NewPool(ctx, 1)
+	pool := concurrency.NewPool(ctx, 1) // TODO: this is not a real value
 
 	var errs error
 
@@ -248,15 +247,19 @@ func (c *ReverseExpandQuery) queryForTuples(
 ) error {
 	// TODO: don't forget telemetry
 	var wg sync.WaitGroup
-	errChan := make(chan error, 100) // TODO: random value here, needs tuning
+	errChan := make(chan error, 100) // TODO: random value here, gotta do this another way
 
+	// This map has to live in this scope, as each leaf kicks off its own queries
+	// TODO: but what about leafs of the same branch, we could end up doing a bunch of duplicate work
+	jobDedupeMap := new(sync.Map)
 	var queryFunc func(context.Context, *ReverseExpandRequest, string)
-
+	numJobs := atomic.Int32{} // TODO: remove, this is for debugging
 	queryFunc = func(qCtx context.Context, r *ReverseExpandRequest, foundObject string) {
 		defer wg.Done()
 		if qCtx.Err() != nil {
 			return
 		}
+		numJobs.Add(1)
 
 		var typeRel string
 		var userFilter []*openfgav1.ObjectRelation
@@ -326,6 +329,18 @@ func (c *ReverseExpandQuery) queryForTuples(
 		fmt.Printf("JUSTIN querying: \n\tUserfilter: %s, relation: %s, objectType: %s\n",
 			userFilter, relation, objectType,
 		)
+
+		// TODO working on getting a unique key for this query
+		// so we can bail out of duplicate work earlier
+		key := utils.Reduce(userFilter, "", func(accumulator string, current *openfgav1.ObjectRelation) string {
+			return current.String() + accumulator
+		})
+		key += relation + objectType
+		if _, loaded := jobDedupeMap.LoadOrStore(key, struct{}{}); loaded {
+			fmt.Println("This query was already run, bailing")
+			return
+		}
+
 		iter, err := c.datastore.ReadStartingWithUser(ctx, req.StoreID, storage.ReadStartingWithUserFilter{
 			ObjectType: objectType,
 			Relation:   relation,
@@ -378,39 +393,50 @@ func (c *ReverseExpandQuery) queryForTuples(
 
 				continue
 			}
+
+			foundObject = tk.GetObject() // This will be a "type:id" e.g. "document:roadmap"
+
 			// If there are no more type#rel to look for in the stack that means we have hit the base case
 			// and this object is a candidate for return to the user.
 			if len(r.stack) == 0 {
-				_ = c.trySendCandidate(ctx, needsCheck, tk.GetObject(), resultChan)
+				_ = c.trySendCandidate(ctx, needsCheck, foundObject, resultChan)
 				continue
 			}
-			// TODO: this is missing the initial relation :sad:
-			// Maybe you need to compare with the request itself in here as well
-			// the block below might also need that comparison, what if there is a recursive TTU
-			// somewhere down the chain of resolution. Do recursive TTUs need to kick off 2 separate
-			// follow up queries? One without removing the top element and one with removing it?
-			// I think yes
+
+			// TODO: explain what's happening here in great detail
 			if r.stack.Peek().isRecursive {
-				_ = c.trySendCandidate(ctx, needsCheck, tk.GetObject(), resultChan)
-				continue
+				// If recursive, check the tuple against the original query
+				// then dispatch two additional queries, one hitting the same recursive relation
+				// and one popping it off and going for the next one
+
+				// This can happen if the query asked explicitly for a recursive relation
+				//if typeRel == tuple.ToObjectRelationString(req.ObjectType, req.Relation) {
+				if len(r.stack) == 1 {
+					_ = c.trySendCandidate(ctx, needsCheck, foundObject, resultChan)
+				}
+				//}
+
+				// For recursive, we need to kick off two additional queries
+				// One for exactly the same relation (recursion), and one for the next relation in the stack
+				// In case the foundObject has a relation higher up the tree
+				wg.Add(1)
+				go queryFunc(qCtx, r, foundObject)
+
+				// len(stack) must be greater than 1 in case the *only* relation left
+				// in the stack is the recursive relation
+				if len(r.stack) > 1 {
+					// Now remove the recursive relation and send this job again
+					newReq := r.clone()
+					_ = newReq.stack.Pop()
+					wg.Add(1)
+					go queryFunc(qCtx, newReq, foundObject)
+				}
 			}
 
 			// if there are more relations in the stack, we need to evaluate the object found here against
 			// the next type#rel one level higher in the tree.
-			foundObject := tk.GetObject() // This will be a "type:id" e.g. "document:roadmap"
-
-			newReq := &ReverseExpandRequest{
-				StoreID:          r.StoreID,
-				Consistency:      r.Consistency,
-				Context:          r.Context,
-				ContextualTuples: r.ContextualTuples,
-				User:             r.User,
-				stack:            r.stack.Copy(),
-				weightedEdge:     r.weightedEdge, // Inherited but not used by the override path
-			}
-
 			wg.Add(1)
-			go queryFunc(qCtx, newReq, foundObject)
+			go queryFunc(qCtx, r.clone(), foundObject)
 		}
 	}
 
@@ -419,6 +445,7 @@ func (c *ReverseExpandQuery) queryForTuples(
 	go queryFunc(ctx, req, "")
 
 	wg.Wait()
+	fmt.Printf("JUstin ran %d jobs\n", numJobs.Load())
 	close(errChan)
 	var errs error
 	for err := range errChan {
