@@ -270,8 +270,8 @@ func (c *ReverseExpandQuery) queryForTuples(
 	var wg sync.WaitGroup
 	errChan := make(chan error, 100) // TODO: random value here, gotta do this another way
 
-	// This map has to live in this scope, as each leaf kicks off its own queries
-	// TODO: figure out why this causes 1 single recursive TTU matrix test to fail
+	// This map is used for memoization within this query path. It prevents re-running the exact
+	// same database query for a given object type, relation, and user filter.
 	jobDedupeMap := new(sync.Map)
 	var queryFunc func(context.Context, *ReverseExpandRequest, string)
 	numJobs := atomic.Int32{} // TODO: remove, this is for debugging
@@ -325,12 +325,13 @@ func (c *ReverseExpandQuery) queryForTuples(
 		objectType, relation := tuple.SplitObjectRelation(typeRel)
 
 		// TODO: polish this bit
-		// so we can bail out of duplicate work earlier
+		// Create a unique key for the current query to avoid duplicate work.
 		key := utils.Reduce(userFilter, "", func(accumulator string, current *openfgav1.ObjectRelation) string {
 			return current.String() + accumulator
 		})
 		key += relation + objectType
 		if _, loaded := jobDedupeMap.LoadOrStore(key, struct{}{}); loaded {
+			// If this exact query has been run before in this path, abort.
 			return
 		}
 
@@ -404,7 +405,6 @@ func (c *ReverseExpandQuery) queryForTuples(
 				if len(r.stack) == 1 {
 					_ = c.trySendCandidate(ctx, needsCheck, foundObject, resultChan)
 				}
-				//}
 
 				// Path 1: Continue the recursive search.
 				// We call `queryFunc` again with the same request (`r`), which keeps the recursive
@@ -424,7 +424,7 @@ func (c *ReverseExpandQuery) queryForTuples(
 					go queryFunc(qCtx, newReq, foundObject)
 				}
 			} else {
-				// For non-recursive relations, if there are more items on the stack, we continue
+				// For non-recursive relations (majority of cases), if there are more items on the stack, we continue
 				// the evaluation one level higher up the tree with the `foundObject`.
 				wg.Add(1)
 				go queryFunc(qCtx, r.clone(), foundObject)
