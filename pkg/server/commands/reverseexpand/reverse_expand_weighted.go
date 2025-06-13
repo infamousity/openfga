@@ -139,6 +139,13 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				// team:fga#member when we check the org
 				r.stack[len(r.stack)-1].usersetRelation = tuple.GetRelation(toNode.GetUniqueLabel())
 
+				// TODO: will this loop infinitely?
+				// We also need to check if this userset is recursive
+				wt, _ := edge.GetWeight(req.User.GetObjectType())
+				if wt == weightedGraph.Infinite { // this means this is a recursive userset
+					r.stack[len(r.stack)-1].isRecursive = true
+				}
+
 				// And then push the new entry, e.g. team#member
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 
@@ -181,7 +188,7 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				_ = r.stack.Pop()
 
 				tuplesetRel := typeRelEntry{typeRel: edge.GetTuplesetRelation()}
-				weight, _ := edge.GetWeight("user") // Make this more legit
+				weight, _ := edge.GetWeight("user") // TODO: Make this more legit
 				if weight == weightedGraph.Infinite {
 					tuplesetRel.isRecursive = true
 				}
@@ -262,7 +269,7 @@ func (c *ReverseExpandQuery) queryForTuples(
 	errChan := make(chan error, 100) // TODO: random value here, gotta do this another way
 
 	// This map has to live in this scope, as each leaf kicks off its own queries
-	// TODO: figure out why this causes 1 single matrix test to fail
+	// TODO: figure out why this causes 1 single recursive TTU matrix test to fail
 	jobDedupeMap := new(sync.Map)
 	var queryFunc func(context.Context, *ReverseExpandRequest, string)
 	numJobs := atomic.Int32{} // TODO: remove, this is for debugging

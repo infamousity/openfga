@@ -1135,6 +1135,26 @@ func TestReverseExpandNew(t *testing.T) {
 			user:            &UserRefObject{Object: &openfgav1.Object{Type: "user", Id: "justin"}},
 			expectedObjects: []string{"org:j", "org:z"},
 		},
+		{
+			name: "recursive_userset",
+			model: `model
+				  schema 1.1
+		
+				type user
+				type team
+				  relations
+					define member: [user, team#member]
+		`,
+			tuples: []string{
+				"team:fga#member@user:justin",
+				"team:cncf#member@team:fga#member",
+				"team:lnf#member@team:cncf#member",
+			},
+			objectType:      "team",
+			relation:        "member",
+			user:            &UserRefObject{Object: &openfgav1.Object{Type: "user", Id: "justin"}},
+			expectedObjects: []string{"team:fga", "team:cncf", "team:lnf"},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
