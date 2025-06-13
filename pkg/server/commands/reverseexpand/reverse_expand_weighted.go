@@ -178,32 +178,28 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				return errs
 			}
 		case weightedGraph.TTUEdge:
-			// Operator nodes (union, intersection, exclusion) are not real types, they never get added
-			// to the stack.
-			if toNode.GetNodeType() != weightedGraph.OperatorNode {
-				// Replace the existing type#rel on the stack with the tuple-to-userset relation:
-				//
-				// 	type document
-				//		define parent: [folder]
-				//		define viewer: admin from parent
-				//
-				// We need to remove document#viewer from the stack and replace it with the tupleset relation (`document#parent`).
-				// Then we have to add the .To() relation `folder#admin`.
-				// The stack becomes `[document#parent, folder#admin]`, and on evaluation we will first
-				// query for folder#admin, then if folders exist we will see if they are related to
-				// any documents as #parent.
-				_ = r.stack.Pop()
+			// Replace the existing type#rel on the stack with the tuple-to-userset relation:
+			//
+			// 	type document
+			//		define parent: [folder]
+			//		define viewer: admin from parent
+			//
+			// We need to remove document#viewer from the stack and replace it with the tupleset relation (`document#parent`).
+			// Then we have to add the .To() relation `folder#admin`.
+			// The stack becomes `[document#parent, folder#admin]`, and on evaluation we will first
+			// query for folder#admin, then if folders exist we will see if they are related to
+			// any documents as #parent.
+			_ = r.stack.Pop()
 
-				tuplesetRel := typeRelEntry{typeRel: edge.GetTuplesetRelation()}
-				weight, _ := edge.GetWeight(req.User.GetObjectType())
-				if weight == weightedGraph.Infinite {
-					tuplesetRel.isRecursive = true
-				}
-				// Push tupleset relation (`document#parent`)
-				r.stack.Push(tuplesetRel)
-				// Push target type#rel (`folder#admin`)
-				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
+			tuplesetRel := typeRelEntry{typeRel: edge.GetTuplesetRelation()}
+			weight, _ := edge.GetWeight(req.User.GetObjectType())
+			if weight == weightedGraph.Infinite {
+				tuplesetRel.isRecursive = true
 			}
+			// Push tupleset relation (`document#parent`)
+			r.stack.Push(tuplesetRel)
+			// Push target type#rel (`folder#admin`)
+			r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 
 			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
 			if err != nil {
@@ -212,6 +208,8 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			}
 		case weightedGraph.RewriteEdge:
 			// Behaves just like ComputedEdge above
+			// Operator nodes (union, intersection, exclusion) are not real types, they never get added
+			// to the stack.
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				_ = r.stack.Pop()
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
