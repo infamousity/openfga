@@ -99,11 +99,11 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			edge:                req.edge,
 			stack:               req.stack.Copy(),
 		}
-		fmt.Printf("Justin Edge: %s --> %s Stack: %+v\n",
-			edge.GetFrom().GetUniqueLabel(),
-			edge.GetTo().GetUniqueLabel(),
-			r.stack.Copy(),
-		)
+		//fmt.Printf("Justin Edge: %s --> %s Stack: %+v\n",
+		//	edge.GetFrom().GetUniqueLabel(),
+		//	edge.GetTo().GetUniqueLabel(),
+		//	r.stack.Copy(),
+		//)
 		toNode := edge.GetTo()
 
 		// combination of From() and To() for usersets should fix the infinite looping issue
@@ -111,21 +111,45 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			key := edge.GetFrom().GetUniqueLabel() + toNode.GetUniqueLabel()
 			if _, loaded := c.visitedUsersetsMap.LoadOrStore(key, struct{}{}); loaded {
 				// we've already visited this userset through this edge, exit to avoid an infinite cycle
-				wt, _ := edge.GetWeight("user")
-				fmt.Printf("JUSTIN WEIGHT INF: %t\n", wt == weightedGraph.Infinite)
-				fmt.Println("ABORTING INFINITE LOOP")
 				continue
 			}
 		}
 
 		switch edge.GetEdgeType() {
 		case weightedGraph.DirectEdge:
-			// TODO: maybe for direct edges which point to usersets we should be continuing the traversal
-			fmt.Printf("Justin Direct Edge: \n\t%s\n\t%s\n\t%+v\n",
-				edge.GetFrom().GetUniqueLabel(),
-				toNode.GetUniqueLabel(),
-				r.stack.Copy(),
-			)
+			//fmt.Printf("Justin Direct Edge: \n\t%s\n\t%s\n\t%+v\n",
+			//	edge.GetFrom().GetUniqueLabel(),
+			//	toNode.GetUniqueLabel(),
+			//	r.stack.Copy(),
+			//)
+			// TODO: it might be that you need to apply the userset relation to the PREVIOUS entry in the stack
+			// check the logic with the simple TTU test
+			// before popping from the stack, you can Peek() to see if the topmost thingy has a userset relation
+			// if it does, you can run the query against that thing without popping, and then any results can be run
+			// as a userset query With Pop()ing to go up the chain
+			// once you hit the terminal type for real "user", "user:*"
+			if toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation {
+				// Attach the userset relation to the prior stack entry
+				//  type team:
+				//		define member: [user]
+				//	type org:
+				//		define teammate: [team#member]
+				// A direct edge here is org#teammate --> team#member
+				// so if we find team:fga for this user, we need to know to check for
+				// team:fga#member when we check the org
+				r.stack[len(r.stack)-1].usersetRelation = tuple.GetRelation(toNode.GetUniqueLabel())
+
+				// And then push the new entry, e.g. team#member
+				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
+
+				// Now continue traversing
+				err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
+				if err != nil {
+					errs = errors.Join(errs, err)
+					return errs
+				}
+				continue
+			}
 			// Now kick off queries for tuples based on the stack of relations we have built to get to this leaf
 			pool.Go(func(ctx context.Context) error {
 				return c.queryForTuples(
@@ -147,19 +171,15 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				return errs
 			}
 		case weightedGraph.TTUEdge:
-			fmt.Printf("Justin TTU Edge before: \n\t%s\n\t%s\n\t%+v\n",
-				edge.GetFrom().GetUniqueLabel(),
-				toNode.GetUniqueLabel(),
-				r.stack.Copy(),
-			)
+			//fmt.Printf("Justin TTU Edge before: \n\t%s\n\t%s\n\t%+v\n",
+			//	edge.GetFrom().GetUniqueLabel(),
+			//	toNode.GetUniqueLabel(),
+			//	r.stack.Copy(),
+			//)
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				// Replace the existing type#rel on the stack with the TTU relation
 				_ = r.stack.Pop()
 
-				// TODO: for the morning
-				// if this edge has weight[user] == INF, this is a recursive TTU
-				// mark the tuplesetrelation as recursive, and leave it on the stack
-				// check the screenshot on your desktop
 				tuplesetRel := typeRelEntry{typeRel: edge.GetTuplesetRelation()}
 				weight, _ := edge.GetWeight("user") // Make this more legit
 				if weight == weightedGraph.Infinite {
@@ -168,20 +188,7 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				r.stack.Push(tuplesetRel)
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 			}
-			// TODO: I think we can determine whether it's recursive here, and if it is we should indicate that
-			// on the stack for this branch somehow. Maybe for those cases we trigger two additional jobs if we find a result
-			// one for the recursive relation and one with the stack modified to continue up the chain
-			// It would just continually loop over the #parent or whatever relationship until it stopped finding tuples
-			// All recursive nodes are basically terminal nodes, since there's no escape, so just query and emit all findings
-			// until we run out. will require adjustment in the final query block
-			// if we still have stack:
-			//		if this is recursive:
-			//			trySendCandidate anyway, and then retrigger with the same relation again forever, until we stop finding tuples
-			fmt.Printf("Justin TTU Edge after: \n\t%s\n\t%s\n\t%+v\n",
-				edge.GetFrom().GetUniqueLabel(),
-				toNode.GetUniqueLabel(),
-				r.stack.Copy(),
-			)
+
 			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
 			if err != nil {
 				errs = errors.Join(errs, err)
@@ -189,6 +196,11 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			}
 		case weightedGraph.RewriteEdge:
 			// bc operator nodes are not real types
+			//fmt.Printf("Justin Rewrite: %s --> %s Stack: %+v\n",
+			//	edge.GetFrom().GetUniqueLabel(),
+			//	edge.GetTo().GetUniqueLabel(),
+			//	r.stack.Copy(),
+			//)
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
 				_ = r.stack.Pop()
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
@@ -250,8 +262,8 @@ func (c *ReverseExpandQuery) queryForTuples(
 	errChan := make(chan error, 100) // TODO: random value here, gotta do this another way
 
 	// This map has to live in this scope, as each leaf kicks off its own queries
-	// TODO: but what about leafs of the same branch, we could end up doing a bunch of duplicate work
-	//jobDedupeMap := new(sync.Map)
+	// TODO: figure out why this causes 1 single matrix test to fail
+	jobDedupeMap := new(sync.Map)
 	var queryFunc func(context.Context, *ReverseExpandRequest, string)
 	numJobs := atomic.Int32{} // TODO: remove, this is for debugging
 	queryFunc = func(qCtx context.Context, r *ReverseExpandRequest, foundObject string) {
@@ -281,11 +293,10 @@ func (c *ReverseExpandQuery) queryForTuples(
 		} else {
 			// this else block ONLY hits on the first call
 			var userID string
-			var userType string
+			// TODO: we might be able to handle pure userset queries now
 			// We will always have a UserRefObject here. Queries that come in for pure usersets do not take this code path.
 			// e.g. ListObjects(team:fga#member, document, viewer) will not make it here.
 			if val, ok := req.User.(*UserRefObject); ok {
-				userType = val.GetObjectType()
 				userID = val.Object.GetId()
 			}
 
@@ -299,29 +310,6 @@ func (c *ReverseExpandQuery) queryForTuples(
 			case weightedGraph.SpecificTypeWildcard: // Wildcard Referece To() -> "user:*"
 				typeRel = req.stack.Pop().typeRel
 				userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: to.GetUniqueLabel()})
-
-			case weightedGraph.SpecificTypeAndRelation: // Userset, To() -> "group#member"
-				typeRel = to.GetUniqueLabel()
-
-				// For a terminal userset edge, we need to attach an additional relation to the last
-				// element in the stack.
-				//
-				// Using this model as an example:
-				//	  type organization
-				//		define repo_admin: [team#member]
-				//
-				// To resolve organization#repo_admin above for user:bob, we first have to see if user:bob is a member of any teams.
-				// If we find this tuple: team:fga#member@user:bob, subsequent recursive calls of this method need to know
-				// to append the #member relation when querying further. Without it, the query isn't meaningful, there cannot be
-				// tuples of the form "organization#repo_admin@team:fga", that isn't valid in this model.
-				// We must append #member to the 'user' in the subsequent query, so it becomes: "organization#repo_admin@team:fga#member".
-				relation := tuple.GetRelation(typeRel)
-				req.stack[len(req.stack)-1].usersetRelation = relation
-
-				// For this case, we can't build the ObjectRelation with the To() from the edge, because it doesn't
-				// Point at an actual type like "user". So we have to use the userType from the original request
-				// to determine whether the requested user is a member of this userset
-				userFilter = append(userFilter, &openfgav1.ObjectRelation{Object: tuple.BuildObject(userType, userID)})
 			}
 		}
 
@@ -330,16 +318,17 @@ func (c *ReverseExpandQuery) queryForTuples(
 			userFilter, relation, objectType,
 		)
 
-		// TODO working on getting a unique key for this query
+		// TODO: polish this bit
 		// so we can bail out of duplicate work earlier
-		//key := utils.Reduce(userFilter, "", func(accumulator string, current *openfgav1.ObjectRelation) string {
-		//	return current.String() + accumulator
-		//})
-		//key += relation + objectType
-		//if _, loaded := jobDedupeMap.LoadOrStore(key, struct{}{}); loaded {
-		//	fmt.Println("This query was already run, bailing")
-		//	return
-		//}
+		key := utils.Reduce(userFilter, "", func(accumulator string, current *openfgav1.ObjectRelation) string {
+			return current.String() + accumulator
+		})
+		key += relation + objectType
+		if _, loaded := jobDedupeMap.LoadOrStore(key, struct{}{}); loaded {
+			fmt.Printf("KEY was already queried: %s, aborting\n", key)
+			//fmt.Println("This query was already run, bailing")
+			return
+		}
 
 		iter, err := c.datastore.ReadStartingWithUser(ctx, req.StoreID, storage.ReadStartingWithUserFilter{
 			ObjectType: objectType,
