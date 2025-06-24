@@ -113,11 +113,8 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 						return tt.optimizedResult, tt.optimizedErr
 					},
 				},
-				logger: logger.NewNoopLogger(),
-				config: NewShadowListObjectsQueryConfig(
-					WithShadowListObjectsQueryEnabled(true),
-					WithShadowListObjectsQuerySamplePercentage(100),
-				),
+				logger:     logger.NewNoopLogger(),
+				percentage: 100, // Always run in shadow mode for testing
 			}
 			result, err := q.Execute(ctx, req)
 			if tt.expectErr {
@@ -181,11 +178,8 @@ func TestShadowedListObjectsQuery_ExecuteStreamed(t *testing.T) {
 						return tt.optimizedResult, tt.optimizedErr
 					},
 				},
-				logger: logger.NewNoopLogger(),
-				config: NewShadowListObjectsQueryConfig(
-					WithShadowListObjectsQueryEnabled(true),
-					WithShadowListObjectsQuerySamplePercentage(100),
-				),
+				logger:     logger.NewNoopLogger(),
+				percentage: 100, // Always run in shadow mode for testing
 			}
 			result, err := q.ExecuteStreamed(ctx, req, nil)
 			if tt.expectErr {
@@ -200,11 +194,13 @@ func TestShadowedListObjectsQuery_ExecuteStreamed(t *testing.T) {
 
 func TestShadowedListObjectsQuery_isShadowModeEnabled(t *testing.T) {
 	q, _ := newShadowedListObjectsQuery(&mockTupleReader{}, &mockCheckResolver{}, NewShadowListObjectsQueryConfig(WithShadowListObjectsQueryEnabled(true), WithShadowListObjectsQuerySamplePercentage(100)))
-	sq := q.(*shadowedListObjectsQuery)
+	sq, ok := q.(*shadowedListObjectsQuery)
+	require.True(t, ok)
 	assert.True(t, sq.checkShadowModeSampleRate())
 
 	q, _ = newShadowedListObjectsQuery(&mockTupleReader{}, &mockCheckResolver{}, NewShadowListObjectsQueryConfig(WithShadowListObjectsQueryEnabled(true), WithShadowListObjectsQuerySamplePercentage(0)))
-	sq = q.(*shadowedListObjectsQuery)
+	sq, ok = q.(*shadowedListObjectsQuery)
+	require.True(t, ok)
 	assert.False(t, sq.checkShadowModeSampleRate())
 }
 

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"slices"
 	"sync"
@@ -17,26 +18,30 @@ import (
 )
 
 type shadowedListObjectsQuery struct {
-	standard  ListObjectsQuery
-	optimized ListObjectsQuery
-	logger    logger.Logger
-	config    *ShadowListObjectsQueryConfig
+	standard   ListObjectsQuery
+	optimized  ListObjectsQuery
+	percentage int           // An integer representing the percentage of list_objects requests that will also trigger the shadow query. This allows for controlled rollout and data collection without impacting all requests. Value should be between 0 and 100.
+	timeout    time.Duration // A time.Duration specifying the maximum amount of time to wait for the shadow list_objects query to complete. If the shadow query exceeds this timeout, it will be cancelled, and its result will be ignored, but the timeout event will be logged.
+	logger     logger.Logger
 }
 
 type ShadowListObjectsQueryOption func(d *ShadowListObjectsQueryConfig)
 
+// WithShadowListObjectsQueryEnabled sets whether the shadow list_objects query should use optimizations.
 func WithShadowListObjectsQueryEnabled(enabled bool) ShadowListObjectsQueryOption {
 	return func(c *ShadowListObjectsQueryConfig) {
 		c.enabled = enabled
 	}
 }
 
+// WithShadowListObjectsQuerySamplePercentage sets the percentage of list_objects requests that will trigger the shadow query.
 func WithShadowListObjectsQuerySamplePercentage(samplePercentage int) ShadowListObjectsQueryOption {
 	return func(c *ShadowListObjectsQueryConfig) {
 		c.percentage = samplePercentage
 	}
 }
 
+// WithShadowListObjectsQueryTimeout sets the timeout for the shadow list_objects query.
 func WithShadowListObjectsQueryTimeout(timeout time.Duration) ShadowListObjectsQueryOption {
 	return func(c *ShadowListObjectsQueryConfig) {
 		c.timeout = timeout
@@ -58,8 +63,10 @@ type ShadowListObjectsQueryConfig struct {
 
 func NewShadowListObjectsQueryConfig(opts ...ShadowListObjectsQueryOption) *ShadowListObjectsQueryConfig {
 	result := &ShadowListObjectsQueryConfig{
-		enabled: false,
-		logger:  logger.NewNoopLogger(),
+		enabled:    false,                  // Disabled by default
+		logger:     logger.NewNoopLogger(), // Default to a noop logger
+		percentage: 0,                      // Default to 0% to disable shadow mode
+		timeout:    1 * time.Second,        // Default timeout for shadow queries
 	}
 	for _, opt := range opts {
 		opt(result)
@@ -67,6 +74,7 @@ func NewShadowListObjectsQueryConfig(opts ...ShadowListObjectsQueryOption) *Shad
 	return result
 }
 
+// NewListObjectsQueryWithShadowConfig creates a new ListObjectsQuery that can run in shadow mode based on the provided ShadowListObjectsQueryConfig.
 func NewListObjectsQueryWithShadowConfig(
 	ds storage.RelationshipTupleReader,
 	checkResolver graph.CheckResolver,
@@ -80,12 +88,16 @@ func NewListObjectsQueryWithShadowConfig(
 	return newListObjectsQuery(ds, checkResolver, opts...)
 }
 
+// newShadowedListObjectsQuery creates a new ListObjectsQuery that runs two queries in parallel: one with optimizations and one without.
 func newShadowedListObjectsQuery(
 	ds storage.RelationshipTupleReader,
 	checkResolver graph.CheckResolver,
 	shadowConfig *ShadowListObjectsQueryConfig,
 	opts ...ListObjectsQueryOption,
 ) (ListObjectsQuery, error) {
+	if shadowConfig == nil {
+		return nil, errors.New("shadowConfig must be set")
+	}
 	standard, err := newListObjectsQuery(ds, checkResolver,
 		// force disable optimizations
 		slices.Concat(opts, []ListObjectsQueryOption{WithListObjectsOptimizationEnabled(false)})...,
@@ -101,15 +113,12 @@ func newShadowedListObjectsQuery(
 		return nil, err
 	}
 
-	if shadowConfig == nil {
-		shadowConfig = NewShadowListObjectsQueryConfig()
-	}
-
 	result := &shadowedListObjectsQuery{
-		standard:  standard,
-		optimized: optimized,
-		logger:    standard.(*listObjectsQuery).logger, // borrow the logger from standard
-		config:    shadowConfig,
+		standard:   standard,
+		optimized:  optimized,
+		percentage: shadowConfig.percentage,
+		timeout:    shadowConfig.timeout,
+		logger:     shadowConfig.logger,
 	}
 
 	return result, nil
@@ -123,7 +132,7 @@ func (q *shadowedListObjectsQuery) Execute(
 		return q.standard.Execute(ctx, req)
 	}
 
-	shadowCtx, shadowCancel := context.WithTimeout(ctx, q.config.timeout)
+	shadowCtx, shadowCancel := context.WithTimeout(ctx, q.timeout)
 	defer shadowCancel()
 
 	latency, latencyOptimized, result, resultOptimized, err, errOptimized := runInParallel(
@@ -160,7 +169,7 @@ func (q *shadowedListObjectsQuery) ExecuteStreamed(ctx context.Context, req *ope
 		return q.standard.ExecuteStreamed(ctx, req, srv)
 	}
 
-	shadowCtx, shadowCancel := context.WithTimeout(ctx, q.config.timeout)
+	shadowCtx, shadowCancel := context.WithTimeout(ctx, q.timeout)
 	defer shadowCancel()
 
 	latency, latencyOptimized, result, resultOptimized, err, errOptimized := runInParallel(
@@ -193,7 +202,7 @@ func (q *shadowedListObjectsQuery) ExecuteStreamed(ctx context.Context, req *ope
 }
 
 func (q *shadowedListObjectsQuery) checkShadowModeSampleRate() bool {
-	percentage := q.config.percentage
+	percentage := q.percentage
 	return int(time.Now().UnixNano()%100) < percentage // randomly enable shadow mode
 }
 

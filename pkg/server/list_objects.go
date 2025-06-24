@@ -189,9 +189,15 @@ func (s *Server) StreamedListObjects(req *openfgav1.StreamedListObjectsRequest, 
 		return err
 	}
 
-	q, err := commands.NewListObjectsQuery(
+	q, err := commands.NewListObjectsQueryWithShadowConfig(
 		s.datastore,
 		s.listObjectsCheckResolver,
+		commands.NewShadowListObjectsQueryConfig(
+			commands.WithShadowListObjectsQueryEnabled(s.shadowListObjectsCheckResolverEnabled),
+			commands.WithShadowListObjectsQuerySamplePercentage(s.shadowListObjectsQuerySamplePercentage),
+			commands.WithShadowListObjectsQueryTimeout(s.shadowListObjectsQueryTimeout),
+			commands.WithShadowListObjectsQueryLogger(s.logger),
+		),
 		commands.WithLogger(s.logger),
 		commands.WithListObjectsDeadline(s.listObjectsDeadline),
 		commands.WithDispatchThrottlerConfig(threshold.Config{
