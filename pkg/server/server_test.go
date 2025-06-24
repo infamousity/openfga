@@ -65,6 +65,9 @@ func ExampleNewServerWithOpts() {
 	openfga, err := NewServerWithOpts(WithDatastore(datastore),
 		WithCheckQueryCacheEnabled(true),
 		// more options available
+		WithShadowListObjectsQueryEnabled(true),
+		WithShadowListObjectsQueryTimeout(17*time.Millisecond),
+		WithShadowListObjectsQuerySamplePercentage(50),
 	)
 	if err != nil {
 		panic(err)

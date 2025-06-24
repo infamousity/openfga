@@ -3,6 +3,9 @@ package commands
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log"
+	"math/rand"
 	"reflect"
 	"slices"
 	"sync"
@@ -23,6 +26,7 @@ type shadowedListObjectsQuery struct {
 	percentage int           // An integer representing the percentage of list_objects requests that will also trigger the shadow query. This allows for controlled rollout and data collection without impacting all requests. Value should be between 0 and 100.
 	timeout    time.Duration // A time.Duration specifying the maximum amount of time to wait for the shadow list_objects query to complete. If the shadow query exceeds this timeout, it will be cancelled, and its result will be ignored, but the timeout event will be logged.
 	logger     logger.Logger
+	random     *rand.Rand
 }
 
 type ShadowListObjectsQueryOption func(d *ShadowListObjectsQueryConfig)
@@ -37,6 +41,9 @@ func WithShadowListObjectsQueryEnabled(enabled bool) ShadowListObjectsQueryOptio
 // WithShadowListObjectsQuerySamplePercentage sets the percentage of list_objects requests that will trigger the shadow query.
 func WithShadowListObjectsQuerySamplePercentage(samplePercentage int) ShadowListObjectsQueryOption {
 	return func(c *ShadowListObjectsQueryConfig) {
+		if samplePercentage < 0 || samplePercentage > 100 {
+			log.Fatalf("Invalid value for sample percentage value=%d, must be between 0 and 100", samplePercentage)
+		}
 		c.percentage = samplePercentage
 	}
 }
@@ -119,6 +126,7 @@ func newShadowedListObjectsQuery(
 		percentage: shadowConfig.percentage,
 		timeout:    shadowConfig.timeout,
 		logger:     shadowConfig.logger,
+		random:     rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 	return result, nil
@@ -151,7 +159,7 @@ func (q *shadowedListObjectsQuery) ExecuteStreamed(ctx context.Context, req *ope
 
 func (q *shadowedListObjectsQuery) checkShadowModeSampleRate() bool {
 	percentage := q.percentage
-	return int(time.Now().UnixNano()%100) < percentage // randomly enable shadow mode
+	return q.random.Intn(100) < percentage // randomly enable shadow mode
 }
 
 // executeShadowMode executes the standard and optimized functions in parallel, returning the result of the standard function if shadow mode is not enabled or if the optimized function fails.
@@ -166,8 +174,9 @@ func executeShadowMode[T any](ctx context.Context, q *shadowedListObjectsQuery, 
 
 	latency, latencyOptimized, result, resultOptimized, err, errOptimized := runInParallel(
 		func() (T, error) {
-			defer shadowCancel() // cancel shadow ctx once standard is done
-			return fnStandard(ctx)
+			standard, err := fnStandard(ctx)
+			shadowCancel() // cancel shadow ctx once standard is done
+			return standard, err
 		},
 		func() (T, error) {
 			return fnOptimized(shadowCtx)
@@ -187,7 +196,7 @@ func executeShadowMode[T any](ctx context.Context, q *shadowedListObjectsQuery, 
 
 	q.logger.Info("shadowed list objects result",
 		zap.String("func", fnName),
-		zap.Bool("equal", reflect.DeepEqual(&result, &resultOptimized)),
+		zap.Bool("equal", reflect.DeepEqual(result, resultOptimized)),
 		zap.Any("result", result),
 		zap.Any("resultOptimized", resultOptimized),
 		zap.Duration("latency", latency),
@@ -196,7 +205,7 @@ func executeShadowMode[T any](ctx context.Context, q *shadowedListObjectsQuery, 
 	return result, nil
 }
 
-// helper to run two functions in parallel and collect their results and latencies.
+// runInParallel helper to run two functions in parallel and collect their results and latencies.
 func runInParallel[T any](
 	fn1 func() (T, error),
 	fn2 func() (T, error),
@@ -207,11 +216,21 @@ func runInParallel[T any](
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				err1 = fmt.Errorf("panic in fn1: %v", r)
+			}
+		}()
 		result1, err1 = fn1()
 		latency1 = time.Since(start)
 	}()
 	go func() {
 		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				err2 = fmt.Errorf("panic in fn2: %v", r)
+			}
+		}()
 		result2, err2 = fn2()
 		latency2 = time.Since(start)
 	}()

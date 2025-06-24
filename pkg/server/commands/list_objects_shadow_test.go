@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -72,6 +73,7 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 
 	tests := []struct {
 		name            string
+		percentage      int
 		standardErr     error
 		optimizedErr    error
 		standardResult  *ListObjectsResponse
@@ -84,18 +86,28 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 			standardResult:  expected,
 			optimizedResult: expectedOpt,
 			expectResult:    expected,
+			percentage:      100,
 		},
 		{
 			name:            "standard_fails",
 			standardErr:     errors.New("fail"),
 			optimizedResult: expectedOpt,
 			expectErr:       true,
+			percentage:      100,
 		},
 		{
 			name:           "optimized_fails",
 			standardResult: expected,
 			optimizedErr:   errors.New("fail"),
 			expectResult:   expected,
+			percentage:     100,
+		},
+		{
+			name:           "turned_off_shadow_mode",
+			standardResult: expected,
+			optimizedErr:   errors.New("ignored"),
+			expectResult:   expected,
+			percentage:     0, // never run shadow
 		},
 	}
 
@@ -114,7 +126,8 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 					},
 				},
 				logger:     logger.NewNoopLogger(),
-				percentage: 100, // Always run in shadow mode for testing
+				percentage: tt.percentage,
+				random:     rand.New(rand.NewSource(time.Now().UnixNano())),
 			}
 			result, err := q.Execute(ctx, req)
 			if tt.expectErr {
@@ -123,6 +136,60 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, tt.expectResult, result)
 			}
+		})
+	}
+}
+
+func TestShadowedListObjectsQuery_Panics(t *testing.T) {
+	t.Cleanup(func() {
+		goleak.VerifyNone(t)
+	})
+	req := &openfgav1.ListObjectsRequest{}
+
+	tests := []struct {
+		name       string
+		percentage int
+	}{
+		{
+			name:       "both_panics",
+			percentage: 100,
+		},
+		{
+			name:       "stardard_panics",
+			percentage: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			q := &shadowedListObjectsQuery{
+				standard: &mockListObjectsQuery{
+					executeFunc: func(ctx context.Context, req *openfgav1.ListObjectsRequest) (*ListObjectsResponse, error) {
+						panic("this is a panic in standard query")
+					},
+				},
+				optimized: &mockListObjectsQuery{
+					executeFunc: func(ctx context.Context, req *openfgav1.ListObjectsRequest) (*ListObjectsResponse, error) {
+						panic("this is a panic in optimized query")
+					},
+				},
+				logger:     logger.NewNoopLogger(),
+				percentage: tt.percentage,
+				random:     rand.New(rand.NewSource(time.Now().UnixNano())),
+			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// should only panic in standard mode
+						assert.Equal(t, 0, tt.percentage)
+					}
+				}()
+				_, err := q.Execute(ctx, req)
+				// in shadow mode, panics are handled and returned as errors
+				require.Error(t, err)
+				assert.Equal(t, 100, tt.percentage)
+			}()
 		})
 	}
 }
@@ -180,6 +247,7 @@ func TestShadowedListObjectsQuery_ExecuteStreamed(t *testing.T) {
 				},
 				logger:     logger.NewNoopLogger(),
 				percentage: 100, // Always run in shadow mode for testing
+				random:     rand.New(rand.NewSource(time.Now().UnixNano())),
 			}
 			result, err := q.ExecuteStreamed(ctx, req, nil)
 			if tt.expectErr {
@@ -202,6 +270,11 @@ func TestShadowedListObjectsQuery_isShadowModeEnabled(t *testing.T) {
 	sq, ok = q.(*shadowedListObjectsQuery)
 	require.True(t, ok)
 	assert.False(t, sq.checkShadowModeSampleRate())
+}
+
+func TestShadowedListObjectsQuery_nilConfig(t *testing.T) {
+	_, err := newShadowedListObjectsQuery(&mockTupleReader{}, &mockCheckResolver{}, nil)
+	require.Error(t, err)
 }
 
 func TestRunInParallel(t *testing.T) {
