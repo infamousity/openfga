@@ -2,15 +2,17 @@ package commands
 
 import (
 	"context"
-	openfgav1 "github.com/openfga/api/proto/openfga/v1"
-	"github.com/openfga/openfga/pkg/logger"
-	"go.uber.org/zap"
 	"reflect"
 	"slices"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
+	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+
 	"github.com/openfga/openfga/internal/graph"
+	"github.com/openfga/openfga/pkg/logger"
 	"github.com/openfga/openfga/pkg/storage"
 )
 
@@ -117,7 +119,6 @@ func (q *shadowedListObjectsQuery) Execute(
 	ctx context.Context,
 	req *openfgav1.ListObjectsRequest,
 ) (*ListObjectsResponse, error) {
-
 	if !q.checkShadowModeSampleRate() {
 		return q.standard.Execute(ctx, req)
 	}
@@ -155,7 +156,6 @@ func (q *shadowedListObjectsQuery) Execute(
 }
 
 func (q *shadowedListObjectsQuery) ExecuteStreamed(ctx context.Context, req *openfgav1.StreamedListObjectsRequest, srv openfgav1.OpenFGAService_StreamedListObjectsServer) (*ListObjectsResolutionMetadata, error) {
-
 	if !q.checkShadowModeSampleRate() {
 		return q.standard.ExecuteStreamed(ctx, req, srv)
 	}
@@ -197,7 +197,7 @@ func (q *shadowedListObjectsQuery) checkShadowModeSampleRate() bool {
 	return int(time.Now().UnixNano()%100) < percentage // randomly enable shadow mode
 }
 
-// helper to run two functions in parallel and collect their results and latencies
+// helper to run two functions in parallel and collect their results and latencies.
 func runInParallel[T any](
 	fn1 func() (T, error),
 	fn2 func() (T, error),

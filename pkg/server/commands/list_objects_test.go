@@ -2,11 +2,10 @@ package commands
 
 import (
 	"context"
-	"github.com/openfga/openfga/pkg/logger"
-	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 	"go.uber.org/mock/gomock"
@@ -19,6 +18,7 @@ import (
 	"github.com/openfga/openfga/internal/mocks"
 	"github.com/openfga/openfga/internal/shared"
 	"github.com/openfga/openfga/internal/throttler/threshold"
+	"github.com/openfga/openfga/pkg/logger"
 	serverconfig "github.com/openfga/openfga/pkg/server/config"
 	"github.com/openfga/openfga/pkg/storage"
 	"github.com/openfga/openfga/pkg/storage/memory"

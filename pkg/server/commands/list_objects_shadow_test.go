@@ -3,18 +3,21 @@ package commands
 import (
 	"context"
 	"errors"
-	"github.com/openfga/openfga/internal/graph"
-	"github.com/openfga/openfga/pkg/storage"
 	"testing"
 	"time"
 
-	openfgav1 "github.com/openfga/api/proto/openfga/v1"
-	"github.com/openfga/openfga/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
+
+	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+
+	"github.com/openfga/openfga/internal/graph"
+	"github.com/openfga/openfga/pkg/logger"
+	"github.com/openfga/openfga/pkg/storage"
 )
 
-// Mock implementations
+// Mock implementations.
 type mockTupleReader struct {
 	storage.RelationshipTupleReader
 }
@@ -34,13 +37,13 @@ func TestNewShadowedListObjectsQuery(t *testing.T) {
 		assert.Equal(t, noopLogger, query.logger)
 	})
 
-	t.Run("ds error", func(t *testing.T) {
+	t.Run("ds_error", func(t *testing.T) {
 		result, err := newShadowedListObjectsQuery(nil, &mockCheckResolver{}, NewShadowListObjectsQueryConfig())
 		require.Error(t, err)
 		require.Nil(t, result)
 	})
 
-	t.Run("check resolver error", func(t *testing.T) {
+	t.Run("check_resolver_error", func(t *testing.T) {
 		result, err := newShadowedListObjectsQuery(&mockTupleReader{}, nil, NewShadowListObjectsQueryConfig())
 		require.Error(t, err)
 		require.Nil(t, result)
@@ -60,7 +63,9 @@ func (m *mockListObjectsQuery) ExecuteStreamed(ctx context.Context, req *openfga
 }
 
 func TestShadowedListObjectsQuery_Execute(t *testing.T) {
-	ctx := context.WithValue(context.Background(), "list-objects-optimization", true)
+	t.Cleanup(func() {
+		goleak.VerifyNone(t)
+	})
 	req := &openfgav1.ListObjectsRequest{}
 	expected := &ListObjectsResponse{Objects: []string{"foo"}}
 	expectedOpt := &ListObjectsResponse{Objects: []string{"foo"}}
@@ -75,19 +80,19 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 		expectResult    *ListObjectsResponse
 	}{
 		{
-			name:            "both succeed, equal results",
+			name:            "both_succeed_with_equal_results",
 			standardResult:  expected,
 			optimizedResult: expectedOpt,
 			expectResult:    expected,
 		},
 		{
-			name:            "standard fails",
+			name:            "standard_fails",
 			standardErr:     errors.New("fail"),
 			optimizedResult: expectedOpt,
 			expectErr:       true,
 		},
 		{
-			name:           "optimized fails",
+			name:           "optimized_fails",
 			standardResult: expected,
 			optimizedErr:   errors.New("fail"),
 			expectResult:   expected,
@@ -96,6 +101,7 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
 			q := &shadowedListObjectsQuery{
 				standard: &mockListObjectsQuery{
 					executeFunc: func(ctx context.Context, req *openfgav1.ListObjectsRequest) (*ListObjectsResponse, error) {
@@ -125,7 +131,9 @@ func TestShadowedListObjectsQuery_Execute(t *testing.T) {
 }
 
 func TestShadowedListObjectsQuery_ExecuteStreamed(t *testing.T) {
-	ctx := context.WithValue(context.Background(), "list-objects-optimization", true)
+	t.Cleanup(func() {
+		goleak.VerifyNone(t)
+	})
 	req := &openfgav1.StreamedListObjectsRequest{}
 	expected := &ListObjectsResolutionMetadata{}
 	expectedOpt := &ListObjectsResolutionMetadata{}
@@ -140,19 +148,19 @@ func TestShadowedListObjectsQuery_ExecuteStreamed(t *testing.T) {
 		expectResult    *ListObjectsResolutionMetadata
 	}{
 		{
-			name:            "both succeed, equal results",
+			name:            "both_succeed_with_equal_results",
 			standardResult:  expected,
 			optimizedResult: expectedOpt,
 			expectResult:    expected,
 		},
 		{
-			name:            "standard fails",
+			name:            "standard_fails",
 			standardErr:     errors.New("fail"),
 			optimizedResult: expectedOpt,
 			expectErr:       true,
 		},
 		{
-			name:           "optimized fails",
+			name:           "optimized_fails",
 			standardResult: expected,
 			optimizedErr:   errors.New("fail"),
 			expectResult:   expected,
@@ -161,6 +169,7 @@ func TestShadowedListObjectsQuery_ExecuteStreamed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
 			q := &shadowedListObjectsQuery{
 				standard: &mockListObjectsQuery{
 					executeStreamedFunc: func(ctx context.Context, req *openfgav1.StreamedListObjectsRequest, srv openfgav1.OpenFGAService_StreamedListObjectsServer) (*ListObjectsResolutionMetadata, error) {
@@ -213,6 +222,6 @@ func TestRunInParallel(t *testing.T) {
 	assert.Equal(t, 2, res2)
 	assert.NoError(t, err1)
 	assert.NoError(t, err2)
-	assert.True(t, lat1 >= 10*time.Microsecond)
-	assert.True(t, lat2 >= 20*time.Microsecond)
+	assert.GreaterOrEqual(t, lat1, 10*time.Microsecond)
+	assert.GreaterOrEqual(t, lat2, 20*time.Microsecond)
 }
