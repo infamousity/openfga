@@ -27,10 +27,6 @@ type typeRelEntry struct {
 	usersetRelation string
 }
 
-// TODO: add these where appropriate, not here
-var typeToCycleMap = new(sync.Map)
-var globalCyclesMap = new(sync.Map)
-
 // relationStack represents the path of queryable relationships encountered on the way to a terminal type.
 // As reverseExpand traverses from a requested type#rel to its leaf nodes, it pushes to this stack.
 // Each entry is a `typeRelEntry` struct, which contains not only the `type#relation`
@@ -308,7 +304,6 @@ func (c *ReverseExpandQuery) queryForTuples(
 
 		objectType, relation := tuple.SplitObjectRelation(typeRel)
 
-		// TODO: polish this bit
 		// Create a unique key for the current query to avoid duplicate work.
 		key := utils.Reduce(userFilter, "", func(accumulator string, current *openfgav1.ObjectRelation) string {
 			return current.String() + accumulator
