@@ -758,6 +758,27 @@ func WithShadowListObjectsCheckResolverSamplePercentage(rate int) OpenFGAService
 	}
 }
 
+// WithShadowListObjectsQueryEnabled turns on shadow list objects query to allow result comparison.
+func WithShadowListObjectsQueryEnabled(enabled bool) OpenFGAServiceV1Option {
+	return func(s *Server) {
+		s.shadowListObjectsQueryEnabled = enabled
+	}
+}
+
+// WithShadowListObjectsQueryTimeout is the amount of time to wait for the shadow ListObjects evaluation response.
+func WithShadowListObjectsQueryTimeout(threshold time.Duration) OpenFGAServiceV1Option {
+	return func(s *Server) {
+		s.shadowListObjectsQueryTimeout = threshold
+	}
+}
+
+// WithShadowListObjectsQuerySamplePercentage is the percentage of requests to sample for shadow ListObjects query.
+func WithShadowListObjectsQuerySamplePercentage(rate int) OpenFGAServiceV1Option {
+	return func(s *Server) {
+		s.shadowListObjectsQuerySamplePercentage = rate
+	}
+}
+
 // WithSharedIteratorEnabled enables iterator to be shared across different consumer.
 func WithSharedIteratorEnabled(enabled bool) OpenFGAServiceV1Option {
 	return func(s *Server) {
