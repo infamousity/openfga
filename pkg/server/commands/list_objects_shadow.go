@@ -128,70 +128,65 @@ func (q *shadowedListObjectsQuery) Execute(
 	ctx context.Context,
 	req *openfgav1.ListObjectsRequest,
 ) (*ListObjectsResponse, error) {
-	if !q.checkShadowModeSampleRate() {
+	var fnStandard = func(ctx context.Context) (*ListObjectsResponse, error) {
 		return q.standard.Execute(ctx, req)
 	}
-
-	shadowCtx, shadowCancel := context.WithTimeout(ctx, q.timeout)
-	defer shadowCancel()
-
-	latency, latencyOptimized, result, resultOptimized, err, errOptimized := runInParallel(
-		func() (*ListObjectsResponse, error) {
-			defer shadowCancel() // cancel shadow ctx once standard is done
-			return q.standard.Execute(ctx, req)
-		},
-		func() (*ListObjectsResponse, error) {
-			return q.optimized.Execute(shadowCtx, req)
-		},
-	)
-
-	if err != nil {
-		return nil, err
+	var fnOptimized = func(ctx context.Context) (*ListObjectsResponse, error) {
+		return q.optimized.Execute(ctx, req)
 	}
 
-	if errOptimized != nil {
-		q.logger.Error("shadowed list objects error", zap.Error(errOptimized))
-		return result, nil
-	}
-
-	q.logger.Info("shadowed list objects",
-		zap.Bool("equal", reflect.DeepEqual(result, resultOptimized)),
-		zap.Any("result", result),
-		zap.Any("resultOptimized", resultOptimized),
-		zap.Duration("latency", latency),
-		zap.Duration("latencyOptimized", latencyOptimized))
-
-	return result, nil
+	return executeShadowMode(ctx, q, "Execute", fnStandard, fnOptimized)
 }
 
 func (q *shadowedListObjectsQuery) ExecuteStreamed(ctx context.Context, req *openfgav1.StreamedListObjectsRequest, srv openfgav1.OpenFGAService_StreamedListObjectsServer) (*ListObjectsResolutionMetadata, error) {
-	if !q.checkShadowModeSampleRate() {
+	var fnStandard = func(ctx context.Context) (*ListObjectsResolutionMetadata, error) {
 		return q.standard.ExecuteStreamed(ctx, req, srv)
+	}
+	var fnOptimized = func(ctx context.Context) (*ListObjectsResolutionMetadata, error) {
+		return q.optimized.ExecuteStreamed(ctx, req, srv)
+	}
+
+	return executeShadowMode(ctx, q, "ExecuteStreamed", fnStandard, fnOptimized)
+}
+
+func (q *shadowedListObjectsQuery) checkShadowModeSampleRate() bool {
+	percentage := q.percentage
+	return int(time.Now().UnixNano()%100) < percentage // randomly enable shadow mode
+}
+
+// executeShadowMode executes the standard and optimized functions in parallel, returning the result of the standard function if shadow mode is not enabled or if the optimized function fails.
+func executeShadowMode[T any](ctx context.Context, q *shadowedListObjectsQuery, fnName string, fnStandard func(ctx context.Context) (T, error), fnOptimized func(ctx context.Context) (T, error)) (T, error) {
+	// If shadow mode is not enabled, just execute the standard query
+	if !q.checkShadowModeSampleRate() {
+		return fnStandard(ctx)
 	}
 
 	shadowCtx, shadowCancel := context.WithTimeout(ctx, q.timeout)
 	defer shadowCancel()
 
 	latency, latencyOptimized, result, resultOptimized, err, errOptimized := runInParallel(
-		func() (*ListObjectsResolutionMetadata, error) {
+		func() (T, error) {
 			defer shadowCancel() // cancel shadow ctx once standard is done
-			return q.standard.ExecuteStreamed(ctx, req, srv)
+			return fnStandard(ctx)
 		},
-		func() (*ListObjectsResolutionMetadata, error) {
-			return q.optimized.ExecuteStreamed(shadowCtx, req, srv)
+		func() (T, error) {
+			return fnOptimized(shadowCtx)
 		},
 	)
 
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
 	if errOptimized != nil {
-		q.logger.Error("shadowed list objects streamed error", zap.Error(errOptimized))
+		q.logger.Error("shadowed list objects error",
+			zap.String("func", fnName),
+			zap.Error(errOptimized))
 		return result, nil
 	}
 
-	q.logger.Info("shadowed list objects streamed",
+	q.logger.Info("shadowed list objects result",
+		zap.String("func", fnName),
 		zap.Bool("equal", reflect.DeepEqual(&result, &resultOptimized)),
 		zap.Any("result", result),
 		zap.Any("resultOptimized", resultOptimized),
@@ -199,11 +194,6 @@ func (q *shadowedListObjectsQuery) ExecuteStreamed(ctx context.Context, req *ope
 		zap.Duration("latencyOptimized", latencyOptimized))
 
 	return result, nil
-}
-
-func (q *shadowedListObjectsQuery) checkShadowModeSampleRate() bool {
-	percentage := q.percentage
-	return int(time.Now().UnixNano()%100) < percentage // randomly enable shadow mode
 }
 
 // helper to run two functions in parallel and collect their results and latencies.
