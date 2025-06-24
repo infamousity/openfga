@@ -55,7 +55,7 @@ func TestNewListObjectsQuery(t *testing.T) {
 func TestNewListObjectsQueryReturnsShadowedQueryWhenEnabled(t *testing.T) {
 	q, err := NewListObjectsQueryWithShadowConfig(memory.New(), graph.NewLocalChecker(), NewShadowListObjectsQueryConfig(
 		WithShadowListObjectsQueryEnabled(true),
-		WithShadowListObjectsQuerySamplePercentage(15),
+		WithShadowListObjectsQuerySamplePercentage(100),
 		WithShadowListObjectsQueryTimeout(13*time.Second),
 		WithShadowListObjectsQueryLogger(logger.NewNoopLogger()),
 	))
