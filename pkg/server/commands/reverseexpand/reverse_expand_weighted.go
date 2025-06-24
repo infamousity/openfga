@@ -114,8 +114,6 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 
 		toNode := edge.GetTo()
 
-		//fmt.Printf("%s --> %s\n\tstack: %+v\n\n", edge.GetFrom().GetUniqueLabel(), toNode.GetUniqueLabel(), req.stack)
-
 		// Going to a userset presents risk of infinite loop. Using from + to ensures
 		// we don't traverse the exact same edge more than once.
 		goingToUserset := toNode.GetNodeType() == weightedGraph.SpecificTypeAndRelation
@@ -123,28 +121,6 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			key := edge.GetFrom().GetUniqueLabel() + toNode.GetUniqueLabel()
 			if _, loaded := c.visitedUsersetsMap.LoadOrStore(key, struct{}{}); loaded {
 				// we've already visited this userset through this edge, exit to avoid an infinite cycle
-
-				var objType string
-				if edge.GetTuplesetRelation() != "" {
-					// if there is a tupleset relation, we should use it when we put this in the map
-					objType, _ = tuple.SplitObjectRelation(edge.GetTuplesetRelation())
-				} else {
-					objType, _ = tuple.SplitObjectRelation(toNode.GetUniqueLabel())
-				}
-
-				fmt.Printf("JUSTIN HIT A CYCLE\n")
-				//fmt.Printf("JUSTIN HIT A CYCLE %s, \n%+v\n", key, r.stack)
-				if cycle, alreadyExists := globalCyclesMap.Load(key); alreadyExists {
-					//fmt.Printf("THIS CYCLE ALREADY EXISTED: %s\n", cycle)
-					typeToCycleMap.Store(objType, cycle.(relationStack))
-				} else {
-					stackForStorage := r.stack.Copy()
-					stackForStorage.Pop() // TODO: explain why this is again
-					globalCyclesMap.Store(key, stackForStorage)
-					typeToCycleMap.Store(objType, stackForStorage)
-					//fmt.Printf("STORING CYCLE: for objectType: %s, %+v\n", objType, stackForStorage)
-				}
-
 				continue
 			}
 		}
