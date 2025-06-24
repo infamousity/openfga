@@ -53,17 +53,21 @@ func TestNewListObjectsQuery(t *testing.T) {
 }
 
 func TestNewListObjectsQueryReturnsShadowedQueryWhenEnabled(t *testing.T) {
+	testLogger := logger.NewNoopLogger()
 	q, err := NewListObjectsQueryWithShadowConfig(memory.New(), graph.NewLocalChecker(), NewShadowListObjectsQueryConfig(
 		WithShadowListObjectsQueryEnabled(true),
 		WithShadowListObjectsQuerySamplePercentage(100),
 		WithShadowListObjectsQueryTimeout(13*time.Second),
-		WithShadowListObjectsQueryLogger(logger.NewNoopLogger()),
+		WithShadowListObjectsQueryLogger(testLogger),
 	))
 	require.NoError(t, err)
 	require.NotNil(t, q)
 	sq, isShadowed := q.(*shadowedListObjectsQuery)
 	require.True(t, isShadowed)
 	assert.True(t, sq.checkShadowModeSampleRate())
+	assert.Equal(t, 100, sq.percentage)
+	assert.Equal(t, 13*time.Second, sq.timeout)
+	assert.Equal(t, testLogger, sq.logger)
 }
 
 func TestNewListObjectsQueryReturnsStandardQueryWhenShadowDisabled(t *testing.T) {
