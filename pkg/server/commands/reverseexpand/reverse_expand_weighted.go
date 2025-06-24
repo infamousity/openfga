@@ -25,8 +25,6 @@ type typeRelEntry struct {
 	// Only present for userset relations. Will be the userset relation string itself.
 	// For `rel admin: [team#member]`, usersetRelation is "member"
 	usersetRelation string
-
-	isRecursive bool
 }
 
 // TODO: add these where appropriate, not here
@@ -164,13 +162,6 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				// team:fga#member when we check org#teammate
 				r.stack[len(r.stack)-1].usersetRelation = tuple.GetRelation(toNode.GetUniqueLabel())
 
-				// We also need to check if this userset is recursive
-				// e.g. `define member: [user] or team#member`
-				wt, _ := edge.GetWeight(req.User.GetObjectType())
-				if wt == weightedGraph.Infinite {
-					r.stack[len(r.stack)-1].isRecursive = true
-				}
-
 				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 
 				// Now continue traversing
@@ -221,13 +212,10 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			// any documents as #parent.
 			_ = r.stack.Pop()
 
-			tuplesetRel := typeRelEntry{typeRel: edge.GetTuplesetRelation()}
-			weight, _ := edge.GetWeight(req.User.GetObjectType())
-			if weight == weightedGraph.Infinite {
-				tuplesetRel.isRecursive = true
-			}
 			// Push tupleset relation (`document#parent`)
+			tuplesetRel := typeRelEntry{typeRel: edge.GetTuplesetRelation()}
 			r.stack.Push(tuplesetRel)
+
 			// Push target type#rel (`folder#admin`)
 			r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 
@@ -317,12 +305,7 @@ func (c *ReverseExpandQuery) queryForTuples(
 
 		// This is true on every call except the first
 		if foundObject != "" {
-			entry := r.stack.Peek()
-			// For recursive relations, don't actually pop the relation off the stack.
-			if !entry.isRecursive {
-				// If it is *not* recursive (most cases), remove the last element
-				r.stack.Pop()
-			}
+			entry := r.stack.Pop()
 			typeRel = entry.typeRel
 			filter := &openfgav1.ObjectRelation{Object: foundObject}
 			if entry.usersetRelation != "" {
@@ -436,10 +419,11 @@ func (c *ReverseExpandQuery) queryForTuples(
 	wg.Add(1)
 	go queryFunc(ctx, req, "")
 
+	var errs error
+
 	wg.Wait()
 	//fmt.Printf("JUstin ran %d jobs\n", numJobs.Load())
 	close(errChan)
-	var errs error
 	for err := range errChan {
 		errs = errors.Join(errs, err)
 	}
