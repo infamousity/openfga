@@ -95,20 +95,9 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 	var errs error
 
 	for _, edge := range edges {
-		r := &ReverseExpandRequest{
-			Consistency:      req.Consistency,
-			Context:          req.Context,
-			ContextualTuples: req.ContextualTuples,
-			ObjectType:       req.ObjectType,
-			Relation:         req.Relation,
-			StoreID:          req.StoreID,
-			User:             req.User,
-
-			weightedEdge:        edge,
-			weightedEdgeTypeRel: edge.GetTo().GetUniqueLabel(),
-			edge:                req.edge,
-			stack:               req.stack.Copy(),
-		}
+		newReq := req.clone()
+		newReq.weightedEdge = edge
+		newReq.weightedEdgeTypeRel = edge.GetTo().GetUniqueLabel()
 
 		toNode := edge.GetTo()
 
@@ -134,12 +123,12 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 				// A direct edge here is org#teammate --> team#member
 				// so if we find team:fga for this user, we need to know to check for
 				// team:fga#member when we check org#teammate
-				r.stack[len(r.stack)-1].usersetRelation = tuple.GetRelation(toNode.GetUniqueLabel())
+				newReq.stack[len(newReq.stack)-1].usersetRelation = tuple.GetRelation(toNode.GetUniqueLabel())
 
-				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
+				newReq.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 
 				// Now continue traversing
-				err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
+				err := c.dispatch(ctx, newReq, resultChan, needsCheck, resolutionMetadata)
 				if err != nil {
 					errs = errors.Join(errs, err)
 					return errs
@@ -153,7 +142,7 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			pool.Go(func(ctx context.Context) error {
 				return c.queryForTuples(
 					ctx,
-					r,
+					newReq,
 					needsCheck,
 					resultChan,
 				)
@@ -163,11 +152,11 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			// We replace the current relation on the stack (`viewer`) with the computed one (`editor`),
 			// as tuples are only written against `editor`.
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
-				_ = r.stack.Pop()
-				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
+				_ = newReq.stack.Pop()
+				newReq.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 			}
 
-			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			err := c.dispatch(ctx, newReq, resultChan, needsCheck, resolutionMetadata)
 			if err != nil {
 				errs = errors.Join(errs, err)
 				return errs
@@ -184,16 +173,16 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			// The stack becomes `[document#parent, folder#admin]`, and on evaluation we will first
 			// query for folder#admin, then if folders exist we will see if they are related to
 			// any documents as #parent.
-			_ = r.stack.Pop()
+			_ = newReq.stack.Pop()
 
 			// Push tupleset relation (`document#parent`)
 			tuplesetRel := typeRelEntry{typeRel: edge.GetTuplesetRelation()}
-			r.stack.Push(tuplesetRel)
+			newReq.stack.Push(tuplesetRel)
 
 			// Push target type#rel (`folder#admin`)
-			r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
+			newReq.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 
-			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			err := c.dispatch(ctx, newReq, resultChan, needsCheck, resolutionMetadata)
 			if err != nil {
 				errs = errors.Join(errs, err)
 				return errs
@@ -203,10 +192,10 @@ func (c *ReverseExpandQuery) loopOverWeightedEdges(
 			// Operator nodes (union, intersection, exclusion) are not real types, they never get added
 			// to the stack.
 			if toNode.GetNodeType() != weightedGraph.OperatorNode {
-				_ = r.stack.Pop()
-				r.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
+				_ = newReq.stack.Pop()
+				newReq.stack.Push(typeRelEntry{typeRel: toNode.GetUniqueLabel()})
 			}
-			err := c.dispatch(ctx, r, resultChan, needsCheck, resolutionMetadata)
+			err := c.dispatch(ctx, newReq, resultChan, needsCheck, resolutionMetadata)
 			if err != nil {
 				errs = errors.Join(errs, err)
 				return errs
@@ -265,9 +254,9 @@ func (c *ReverseExpandQuery) queryForTuples(
 	jobDedupeMap := new(sync.Map)
 
 	var queryFunc func(context.Context, *ReverseExpandRequest, string) error
-	queryFunc = func(qCtx context.Context, r *ReverseExpandRequest, foundObject string) error {
-		if qCtx.Err() != nil {
-			return qCtx.Err()
+	queryFunc = func(childCtx context.Context, r *ReverseExpandRequest, foundObject string) error {
+		if childCtx.Err() != nil {
+			return childCtx.Err()
 		}
 
 		// Ensure we're always working with a copy
@@ -295,13 +284,13 @@ func (c *ReverseExpandQuery) queryForTuples(
 
 		// TODO: this means EACH query could start resolveNodeBreadthLimit goroutines which defeats the purpose of a limit
 		// Could manage the limit with select over a channel
-		pool := concurrency.NewPool(ctx, int(c.resolveNodeBreadthLimit))
+		pool := concurrency.NewPool(childCtx, int(c.resolveNodeBreadthLimit))
 
 		var errs error
 
 	LoopOnIterator:
 		for {
-			tk, err := filteredIter.Next(ctx)
+			tupleKey, err := filteredIter.Next(childCtx)
 			if err != nil {
 				if errors.Is(err, storage.ErrIteratorDone) {
 					break
@@ -310,7 +299,7 @@ func (c *ReverseExpandQuery) queryForTuples(
 				break LoopOnIterator
 			}
 
-			condEvalResult, err := eval.EvaluateTupleCondition(ctx, tk, c.typesystem, req.Context)
+			condEvalResult, err := eval.EvaluateTupleCondition(childCtx, tupleKey, c.typesystem, req.Context)
 			if err != nil {
 				errs = errors.Join(errs, err)
 				continue
@@ -319,9 +308,9 @@ func (c *ReverseExpandQuery) queryForTuples(
 			if !condEvalResult.ConditionMet {
 				if len(condEvalResult.MissingParameters) > 0 {
 					errs = errors.Join(errs, condition.NewEvaluationError(
-						tk.GetCondition().GetName(),
+						tupleKey.GetCondition().GetName(),
 						fmt.Errorf("tuple '%s' is missing context parameters '%v'",
-							tuple.TupleKeyToString(tk),
+							tuple.TupleKeyToString(tupleKey),
 							condEvalResult.MissingParameters),
 					))
 				}
@@ -330,19 +319,19 @@ func (c *ReverseExpandQuery) queryForTuples(
 			}
 
 			// This will be a "type:id" e.g. "document:roadmap"
-			foundObject = tk.GetObject()
+			foundObject = tupleKey.GetObject()
 
 			// If there are no more type#rel to look for in the stack that means we have hit the base case
 			// and this object is a candidate for return to the user.
 			if len(currentReq.stack) == 0 {
-				_ = c.trySendCandidate(ctx, needsCheck, foundObject, resultChan)
+				_ = c.trySendCandidate(childCtx, needsCheck, foundObject, resultChan)
 				continue
 			}
 
 			// For non-recursive relations (majority of cases), if there are more items on the stack, we continue
 			// the evaluation one level higher up the tree with the `foundObject`.
-			pool.Go(func(qCtx context.Context) error {
-				return queryFunc(qCtx, currentReq, foundObject)
+			pool.Go(func(ctx context.Context) error {
+				return queryFunc(childCtx, currentReq, foundObject)
 			})
 		}
 
