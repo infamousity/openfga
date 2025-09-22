@@ -2,25 +2,32 @@ package commands
 
 import (
 	"context"
+	"sort"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 	"go.uber.org/mock/gomock"
 	"golang.org/x/sync/singleflight"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+	parser "github.com/openfga/language/pkg/go/transformer"
 
 	"github.com/openfga/openfga/internal/errors"
 	"github.com/openfga/openfga/internal/graph"
 	"github.com/openfga/openfga/internal/mocks"
 	"github.com/openfga/openfga/internal/shared"
 	"github.com/openfga/openfga/internal/throttler/threshold"
+	"github.com/openfga/openfga/pkg/logger"
 	serverconfig "github.com/openfga/openfga/pkg/server/config"
 	"github.com/openfga/openfga/pkg/storage"
 	"github.com/openfga/openfga/pkg/storage/memory"
 	storagetest "github.com/openfga/openfga/pkg/storage/test"
+	"github.com/openfga/openfga/pkg/tuple"
 	"github.com/openfga/openfga/pkg/typesystem"
 )
 
@@ -48,6 +55,34 @@ func TestNewListObjectsQuery(t *testing.T) {
 		_, err = q.Execute(context.Background(), &openfgav1.ListObjectsRequest{})
 		require.ErrorContains(t, err, "typesystem missing in context")
 	})
+}
+
+func TestNewListObjectsQueryReturnsShadowedQueryWhenEnabled(t *testing.T) {
+	testLogger := logger.NewNoopLogger()
+	q, err := NewListObjectsQueryWithShadowConfig(memory.New(), graph.NewLocalChecker(), NewShadowListObjectsQueryConfig(
+		WithShadowListObjectsQueryEnabled(true),
+		WithShadowListObjectsQuerySamplePercentage(100),
+		WithShadowListObjectsQueryTimeout(13*time.Second),
+		WithShadowListObjectsQueryLogger(testLogger),
+	))
+	require.NoError(t, err)
+	require.NotNil(t, q)
+	sq, isShadowed := q.(*shadowedListObjectsQuery)
+	require.True(t, isShadowed)
+	assert.True(t, sq.checkShadowModeSampleRate())
+	assert.Equal(t, 100, sq.shadowPct)
+	assert.Equal(t, 13*time.Second, sq.shadowTimeout)
+	assert.Equal(t, testLogger, sq.logger)
+}
+
+func TestNewListObjectsQueryReturnsStandardQueryWhenShadowDisabled(t *testing.T) {
+	q, err := NewListObjectsQueryWithShadowConfig(memory.New(), graph.NewLocalChecker(), NewShadowListObjectsQueryConfig(
+		WithShadowListObjectsQueryEnabled(false),
+	))
+	require.NoError(t, err)
+	require.NotNil(t, q)
+	_, isStandard := q.(*ListObjectsQuery)
+	require.True(t, isStandard)
 }
 
 func TestListObjectsDispatchCount(t *testing.T) {
@@ -450,76 +485,352 @@ func TestErrorInCheckSurfacesInListObjects(t *testing.T) {
 	require.ErrorIs(t, err, errors.ErrUnknown)
 }
 func TestAttemptsToInvalidateWhenIteratorCacheIsEnabled(t *testing.T) {
-	ds := memory.New()
-	t.Cleanup(ds.Close)
-	ctx := storage.ContextWithRelationshipTupleReader(context.Background(), ds)
-	ctrl := gomock.NewController(t)
-	t.Cleanup(ctrl.Finish)
-	modelDsl := `model
+	tests := []struct {
+		shadowEnabled bool
+	}{
+		{
+			shadowEnabled: false,
+		},
+		{
+			shadowEnabled: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run("shadow_enabled_"+strconv.FormatBool(test.shadowEnabled), func(t *testing.T) {
+			ds := memory.New()
+			t.Cleanup(ds.Close)
+			ctx := storage.ContextWithRelationshipTupleReader(context.Background(), ds)
+			ctrl := gomock.NewController(t)
+			t.Cleanup(ctrl.Finish)
+			modelDsl := `model
 			schema 1.1
 			type user
 			type folder
 				relations
 					define viewer: [user] but not blocked
 					define blocked: [user]`
-	tuples := []string{
-		"folder:C#viewer@user:jon",
-		"folder:B#viewer@user:jon",
-		"folder:A#viewer@user:jon",
+			tuples := []string{
+				"folder:C#viewer@user:jon",
+				"folder:B#viewer@user:jon",
+				"folder:A#viewer@user:jon",
+			}
+
+			storeID, model := storagetest.BootstrapFGAStore(t, ds, modelDsl, tuples)
+			ts, err := typesystem.NewAndValidate(
+				context.Background(),
+				model,
+			)
+			require.NoError(t, err)
+
+			ctx = typesystem.ContextWithTypesystem(ctx, ts)
+
+			// Don't care about the resolver for this test
+			mockCheckResolver := graph.NewMockCheckResolver(ctrl)
+			mockCheckResolver.EXPECT().ResolveCheck(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(ctx context.Context, req *graph.ResolveCheckRequest) (*graph.ResolveCheckResponse, error) {
+				return &graph.ResolveCheckResponse{}, nil
+			})
+			mockCheckResolver.EXPECT().GetDelegate().AnyTimes().Return(nil)
+
+			// Need to make sure list objects attempts to invalidate when cache is enabled
+			mockCacheController := mocks.NewMockCacheController(ctrl)
+			mockCacheController.EXPECT().InvalidateIfNeeded(gomock.Any(), gomock.Any()).Times(1)
+
+			mockShadowCacheController := mocks.NewMockCacheController(ctrl)
+			if test.shadowEnabled {
+				mockShadowCacheController.EXPECT().InvalidateIfNeeded(gomock.Any(), gomock.Any()).Times(1)
+			}
+
+			cacheSettings := serverconfig.CacheSettings{
+				ListObjectsIteratorCacheEnabled:    true,
+				ListObjectsIteratorCacheTTL:        1 * time.Second,
+				ListObjectsIteratorCacheMaxResults: 1000,
+				CacheControllerEnabled:             true,
+				CacheControllerTTL:                 1 * time.Nanosecond,
+				CheckCacheLimit:                    1000,
+				ShadowCheckCacheEnabled:            test.shadowEnabled,
+			}
+
+			sharedResources, err := shared.NewSharedDatastoreResources(
+				ctx,
+				&singleflight.Group{},
+				ds,
+				cacheSettings,
+				shared.WithCacheController(mockCacheController),
+				shared.WithShadowCacheController(mockShadowCacheController),
+			)
+			require.NoError(t, err)
+
+			q, _ := NewListObjectsQuery(
+				ds,
+				mockCheckResolver,
+				WithListObjectsCache(sharedResources, cacheSettings),
+			)
+
+			// Run a check, mockCacheController should receive its invalidate call
+			_, err = q.Execute(ctx, &openfgav1.ListObjectsRequest{
+				StoreId:  storeID,
+				Type:     "folder",
+				Relation: "viewer",
+				User:     "user:jon",
+			})
+
+			sharedResources.Close()
+			require.NoError(t, err)
+		})
 	}
+}
 
-	storeID, model := storagetest.BootstrapFGAStore(t, ds, modelDsl, tuples)
-	ts, err := typesystem.NewAndValidate(
-		context.Background(),
-		model,
+func reportLatencies(b *testing.B, latencies []time.Duration) {
+	// Sort latencies ascending
+	sort.Slice(latencies, func(i, j int) bool {
+		return latencies[i] < latencies[j]
+	})
+
+	p95 := latencies[len(latencies)*95/100]
+	p99 := latencies[len(latencies)*99/100]
+	worst := latencies[len(latencies)-1]
+	best := latencies[0]
+
+	b.ReportMetric(float64(best.Microseconds()), "min_us")
+	b.ReportMetric(float64(worst.Microseconds()), "max_us")
+	b.ReportMetric(float64(p95.Microseconds()), "p95_us")
+	b.ReportMetric(float64(p99.Microseconds()), "p99_us")
+}
+
+func runOneBenchmark(
+	b *testing.B,
+	ctx context.Context,
+	name string,
+	optimizationsEnabled bool,
+	query ListObjectsQuery,
+	request *openfgav1.ListObjectsRequest,
+) {
+	if optimizationsEnabled {
+		name += "_with_optimization"
+		query.optimizationsEnabled = true
+	} else {
+		query.optimizationsEnabled = false
+	}
+	var latencies []time.Duration
+	b.Run(name, func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			start := time.Now()
+			res, err := query.Execute(ctx, request)
+			latencies = append(latencies, time.Since(start))
+			require.NoError(b, err)
+
+			// all the tests are configured to return 5k objects
+			require.Len(b, res.Objects, 5000)
+		}
+		reportLatencies(b, latencies)
+	})
+}
+
+// BenchmarkListObjects sets up an authorization model with various relationship weights:
+// weight one direct, weight one computed, weight two, weight three, and recursive (weight INF).
+// The benchmarks are currently run 2x—once with optimizations enabled and once without.
+func BenchmarkListObjects(b *testing.B) {
+	datastore := memory.New()
+	b.Cleanup(datastore.Close)
+	storeID := ulid.Make().String()
+
+	model := &openfgav1.AuthorizationModel{
+		Id:            ulid.Make().String(),
+		SchemaVersion: typesystem.SchemaVersion1_1,
+		TypeDefinitions: parser.MustTransformDSLToProto(`
+			model
+			schema 1.1
+			type user
+			type org
+				relations
+					define member: [user]
+					define computed: member
+					define parent: [org]
+					define recursive: [user] or recursive from parent
+			type company
+				relations
+					define owner: [org]
+					define org_member: member from owner
+			type office
+				relations
+					define parent: [company]
+					define weight_three: org_member from parent
+		`).GetTypeDefinitions(),
+	}
+	ctx := context.Background()
+	err := datastore.WriteAuthorizationModel(ctx, storeID, model)
+	require.NoError(b, err)
+
+	n := 5000
+	createDirectWeightOneRelations(b, ctx, datastore, storeID, n)
+	createWeightTwoRelations(b, ctx, datastore, storeID, n)
+	createWeightThreeRelations(b, ctx, datastore, storeID, n)
+	createRecursiveRelations(b, ctx, datastore, storeID, n)
+
+	checkResolver, checkResolverCloser, err := graph.NewOrderedCheckResolvers().Build()
+	require.NoError(b, err)
+	b.Cleanup(checkResolverCloser)
+
+	query, err := NewListObjectsQuery(
+		datastore,
+		checkResolver,
+		WithListObjectsOptimizationsEnabled(true),
+
+		// unlimited results, these tests are designed to return `n` results per iteration
+		WithListObjectsMaxResults(0),
 	)
-	require.NoError(t, err)
+	require.NoError(b, err)
 
+	ts, err := typesystem.New(model)
+	require.NoError(b, err)
 	ctx = typesystem.ContextWithTypesystem(ctx, ts)
 
-	// Don't care about the resolver for this test
-	mockCheckResolver := graph.NewMockCheckResolver(ctrl)
-	mockCheckResolver.EXPECT().ResolveCheck(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(func(ctx context.Context, req *graph.ResolveCheckRequest) (*graph.ResolveCheckResponse, error) {
-		return &graph.ResolveCheckResponse{}, nil
-	})
-	mockCheckResolver.EXPECT().GetDelegate().AnyTimes().Return(nil)
-
-	// Need to make sure list objects attempts to invalidate when cache is enabled
-	mockCacheController := mocks.NewMockCacheController(ctrl)
-	mockCacheController.EXPECT().InvalidateIfNeeded(gomock.Any(), gomock.Any()).Times(1)
-
-	cacheSettings := serverconfig.CacheSettings{
-		ListObjectsIteratorCacheEnabled:    true,
-		ListObjectsIteratorCacheTTL:        1 * time.Second,
-		ListObjectsIteratorCacheMaxResults: 1000,
-		CacheControllerEnabled:             true,
-		CacheControllerTTL:                 1 * time.Nanosecond,
-		CheckCacheLimit:                    1000,
+	weightOneRequest := &openfgav1.ListObjectsRequest{
+		StoreId:              storeID,
+		AuthorizationModelId: model.GetId(),
+		Type:                 "org",
+		Relation:             "member",
+		User:                 "user:justin",
 	}
 
-	sharedResources, err := shared.NewSharedDatastoreResources(
-		ctx,
-		&singleflight.Group{},
-		ds,
-		cacheSettings,
-		shared.WithCacheController(mockCacheController),
-	)
-	require.NoError(t, err)
+	// once with optimizations enabled, once without
+	runOneBenchmark(b, ctx, "weight_one_direct", true, *query, weightOneRequest)
+	runOneBenchmark(b, ctx, "weight_one_direct", false, *query, weightOneRequest)
 
-	q, _ := NewListObjectsQuery(
-		ds,
-		mockCheckResolver,
-		WithListObjectsCache(sharedResources, cacheSettings),
-	)
+	weightOneComputedRequest := &openfgav1.ListObjectsRequest{
+		StoreId:              storeID,
+		AuthorizationModelId: model.GetId(),
+		Type:                 "org",
+		Relation:             "computed",
+		User:                 "user:justin",
+	}
 
-	// Run a check, mockCacheController should receive its invalidate call
-	_, err = q.Execute(ctx, &openfgav1.ListObjectsRequest{
-		StoreId:  storeID,
-		Type:     "folder",
-		Relation: "viewer",
-		User:     "user:jon",
-	})
+	// once with optimizations enabled, once without
+	runOneBenchmark(b, ctx, "weight_one_computed", true, *query, weightOneComputedRequest)
+	runOneBenchmark(b, ctx, "weight_one_computed", false, *query, weightOneComputedRequest)
 
-	sharedResources.Close()
-	require.NoError(t, err)
+	weightTwoRequest := &openfgav1.ListObjectsRequest{
+		StoreId:              storeID,
+		AuthorizationModelId: model.GetId(),
+		Type:                 "company",
+		Relation:             "org_member",
+		User:                 "user:justin",
+	}
+	// once with optimizations enabled, once without
+	runOneBenchmark(b, ctx, "weight_two_ttu", true, *query, weightTwoRequest)
+	runOneBenchmark(b, ctx, "weight_two_ttu", false, *query, weightTwoRequest)
+
+	weightThreeRequest := &openfgav1.ListObjectsRequest{
+		StoreId:              storeID,
+		AuthorizationModelId: model.GetId(),
+		Type:                 "office",
+		Relation:             "weight_three",
+		User:                 "user:justin",
+	}
+
+	// once with optimizations enabled, once without
+	runOneBenchmark(b, ctx, "weight_three", true, *query, weightThreeRequest)
+	runOneBenchmark(b, ctx, "weight_three", false, *query, weightThreeRequest)
+
+	recursiveRequest := &openfgav1.ListObjectsRequest{
+		StoreId:              storeID,
+		AuthorizationModelId: model.GetId(),
+		Type:                 "org",
+		Relation:             "recursive",
+		User:                 "user:justin",
+	}
+
+	// optimization currently falls back to non-optimized code when it's a recursive query
+	// Uncomment this when recursive listObjects work is underway
+	// runOneBenchmark(b, ctx, "recursive_ttu", true, *query, recursiveRequest)
+
+	runOneBenchmark(b, ctx, "recursive_ttu", false, *query, recursiveRequest)
+}
+
+// This helper writes tuples for user:justin with relation "member" to org:0...org:numTuples.
+func createDirectWeightOneRelations(
+	b *testing.B,
+	ctx context.Context,
+	datastore storage.OpenFGADatastore,
+	storeID string,
+	numTuples int,
+) {
+	b.Helper()
+	objID := 0
+	for objID < numTuples {
+		tuples := make([]*openfgav1.TupleKey, datastore.MaxTuplesPerWrite())
+
+		for j := 0; j < datastore.MaxTuplesPerWrite(); j++ {
+			obj := "org:" + strconv.Itoa(objID)
+			tuples[j] = tuple.NewTupleKey(obj, "member", "user:justin")
+			objID++
+		}
+		err := datastore.Write(ctx, storeID, nil, tuples)
+		require.NoError(b, err)
+	}
+}
+
+func createWeightTwoRelations(b *testing.B, ctx context.Context, datastore storage.OpenFGADatastore, storeID string, numTuples int) {
+	b.Helper()
+	objID := 0
+	for objID < numTuples {
+		tuples := make([]*openfgav1.TupleKey, datastore.MaxTuplesPerWrite())
+
+		for j := 0; j < datastore.MaxTuplesPerWrite(); j++ {
+			// These IDs can be the same as we already created org:0 - org:numTuples
+			obj := "company:" + strconv.Itoa(objID)
+			user := "org:" + strconv.Itoa(objID)
+			tuples[j] = tuple.NewTupleKey(obj, "owner", user)
+			objID++
+		}
+		err := datastore.Write(ctx, storeID, nil, tuples)
+		require.NoError(b, err)
+	}
+}
+
+func createWeightThreeRelations(b *testing.B, ctx context.Context, datastore storage.OpenFGADatastore, storeID string, numTuples int) {
+	b.Helper()
+	objID := 0
+	for objID < numTuples {
+		tuples := make([]*openfgav1.TupleKey, datastore.MaxTuplesPerWrite())
+
+		for j := 0; j < datastore.MaxTuplesPerWrite(); j++ {
+			// These IDs can be the same as we already created org:0 - org:numTuples
+			obj := "office:" + strconv.Itoa(objID)
+			user := "company:" + strconv.Itoa(objID)
+			tuples[j] = tuple.NewTupleKey(obj, "parent", user)
+			objID++
+		}
+		err := datastore.Write(ctx, storeID, nil, tuples)
+		require.NoError(b, err)
+	}
+}
+
+func createRecursiveRelations(b *testing.B, ctx context.Context, datastore storage.OpenFGADatastore, storeID string, numTuples int) {
+	b.Helper()
+	objID := 0
+	for objID < numTuples {
+		tuples := make([]*openfgav1.TupleKey, datastore.MaxTuplesPerWrite())
+
+		for j := 0; j < datastore.MaxTuplesPerWrite(); j++ {
+			// Every 10th item, make user:justin the leaf
+			if j%10 == 0 {
+				obj := "org:" + strconv.Itoa(objID)
+				tk := tuple.NewTupleKey(obj, "recursive", "user:justin")
+				tuples[j] = tk
+				tuples = append(tuples, tk)
+				objID++
+				continue
+			}
+
+			// otherwise, chain the org#parent#org relation
+			obj := "org:" + strconv.Itoa(objID)
+			user := "org:" + strconv.Itoa(objID-1)
+			tuples[j] = tuple.NewTupleKey(obj, "parent", user)
+			objID++
+		}
+		err := datastore.Write(ctx, storeID, nil, tuples)
+		require.NoError(b, err)
+	}
 }

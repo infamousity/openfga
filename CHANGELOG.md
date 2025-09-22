@@ -7,8 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Try to keep listed changes to a concise bulleted list of simple explanations of changes. Aim for the amount of information needed so that readers can understand where they would look in the codebase to investigate the changes' implementation, or where they would look in the documentation to understand how to make use of the change in practice - better yet, link directly to the docs and provide detailed information there. Only elaborate if doing so is required to avoid breaking changes or experimental features from ruining someone's day.
 
 ## [Unreleased]
+### Fixed
+- Revert spf13/viper back to v.1.20.1 to avoid bumping sourcegraph/conc to an unreleased version as it causes performance degradation. [#2706](https://github.com/openfga/openfga/pull/2706)
+
+## [1.10.0] - 2025-09-11
+### Added
+- Make number of querying goroutines in experimental reverse_expand configurable via `resolveNodeBreadthLimit`. [#2652](https://github.com/openfga/openfga/pull/2652)
+- Add microsecond latency numbers and datastore query count in shadow check resolver. [#2658](https://github.com/openfga/openfga/pull/2658)
+- Add `NewWithDB` support for sqlite storage. [#2679](https://github.com/openfga/openfga/pull/2679)
+- Add planner for selecting check resolution strategies based on runtime statistics, behind the `enable-check-optimization` flag. [#2624](https://github.com/openfga/openfga/pull/2624)
+- Add `server.WithShadowCheckCacheEnabled` to enable creation of a separate cache for shadow check resolver. [#2683](https://github.com/openfga/openfga/pull/2683)
+- Run weight 2 optimization for cases where there are more than 1 directly assignable userset. [#2684](https://github.com/openfga/openfga/pull/2684)
+
+### Changed
+- Make experimental reverse_expand behave the same as old reverse_expand in case of timeouts. [#2649](https://github.com/openfga/openfga/pull/2649)
+- Breaking: Changes to storage interface
+
+  > [!NOTE]
+  > The following breaking changes are related to the storage interface. If you are not implementing a storage adapter, then these changes should not impact your usage of OpenFGA.
+
+  - Changed the `RelationshipTupleWriter` datastore interface to accept variadic write options (`opts ...TupleWriteOption`) to customize behavior on duplicate inserts and missing deletes. [#2663](https://github.com/openfga/openfga/pull/2663)
+    Implementers must update the `Write` method signature to include `opts ...TupleWriteOption`. Defaults preserve prior behavior (error on duplicates and on missing deletes). Example:
+    `Write(ctx, store, deletes, writes, storage.WithOnDuplicateInsert(storage.OnDuplicateInsertIgnore))`
+
+### Fixed
+- Fixed bug in how experimental ReverseExpand support for ttus with multiple parents in the intersection and exclusion for list objects. [#2691](https://github.com/openfga/openfga/pull/2691)
+- Improve performance by allowing weight 2 optimization if the directly assignable userset types are of different types. [#2645](https://github.com/openfga/openfga/pull/2645)
+- Update ListObjects' check resolver to use correct environment variable. [#2653](https://github.com/openfga/openfga/pull/2653)
+- !!REQUIRES MIGRATION!! Collation specification for queries dependent on sort order. [#2661](https://github.com/openfga/openfga/pull/2661)
+    - PostgreSQL is non-disruptive.
+    - MySQL requires a shared lock on the tuple table during the transaction.
+
+## [1.9.5] - 2025-08-15
+### Fixed
+- Do not run weight 2 optimization for cases where there are more than 1 directly assignable userset. [#2643](https://github.com/openfga/openfga/pull/2643)
+
+## [1.9.4] - 2025-08-13
+### Fixed
+- Fix breaking change introduced after upgrading the JWT dependency from v5.2.2 to v.5.3.0. [#2636](https://github.com/openfga/openfga/pull/2636)
+
+## [1.9.3] - 2025-08-11
+### Added
+- Add `check_count` grpc tag to list objects requests. [#2515](https://github.com/openfga/openfga/pull/2515)
+- Promote the Check fast path v2 implementations to no longer being behind the `enable-check-optimizations` config flag. [#2609](https://github.com/openfga/openfga/pull/2609)
+
+### Changed
+- Change ListObjectsResolutionMetadata fields to value types instead of pointers. [#2583](https://github.com/openfga/openfga/pull/2583)
+- Instead of panic when encountering unknown parameters in hasEntrypoints, return internal error to allow graceful handling. [#2588](https://github.com/openfga/openfga/pull/2588)
+- Shared iterators now rely entirely on a TTL for eviction from the pool. [#2590](https://github.com/openfga/openfga/pull/2590)
+- Update go toolchain version to 1.24.6 - related: [CVE-2025-47907](https://nvd.nist.gov/vuln/detail/CVE-2025-47907)
+- Revert min supported go version to 1.24.0
+- Bump the base docker image to `cgr.dev/chainguard/static@sha256:6a4b683f4708f1f167ba218e31fcac0b7515d94c33c3acf223c36d5c6acd3783`
+
+### Fixed
+- Fixed bug in how experimental ReverseExpand is handling duplicate TTUs. [#2589](https://github.com/openfga/openfga/pull/2589)
+- Fixed bug in how experimental ReverseExpand is handling duplicate edge traversals. [#2594](https://github.com/openfga/openfga/pull/2594)
+- Fixed logs in ListObjects weighted graph to include `store_id` and `authorization_model_id` through the context. [#2581](https://github.com/openfga/openfga/pull/2581)
+- Fixed bug where OpenFGA fail to start when both secondary DB and db metrics enabled. [#2598](https://github.com/openfga/openfga/pull/2598)
+
+### Security
+- Bumped up the `grpc-health-probe` dependency in the published Docker image to the latest release (v0.4.39) which fixes some vulnerabilities. [#2601](https://github.com/openfga/openfga/pull/2601)
+
+## [1.9.2] - 2025-07-24
+### Added
+- Add `list_objects_optimization_count` metric to list objects requests. [#2524](https://github.com/openfga/openfga/pull/2524)
+
+### Changed
+- Update ReverseExpand to use a LinkedList to track its relation stack for performance. [#2542](https://github.com/openfga/openfga/pull/2542)
+- Update ReverseExpand to use a intersection and exclusion handler to fast path check calls. [#2543](https://github.com/openfga/openfga/pull/2543)
+- Deduplicate queries more effectively in ReverseExpand. [#2567](https://github.com/openfga/openfga/pull/2567)
+- Update go version to 1.24.5 [#2577](https://github.com/openfga/openfga/pull/2577)
+
+### Fixed
+- Shared iterator race condition and deadlock. [#2544](https://github.com/openfga/openfga/pull/2544)
+- Fixed bug in how experimental ReverseExpand is handling Intersection nodes. [#2556](https://github.com/openfga/openfga/pull/2556)
+- Migration command now respects logging configuration options. [#2541](https://github.com/openfga/openfga/issues/2541)
+- Fixed message in log and slight refactor in list objects intersection/exclusion. [#2566](https://github.com/openfga/openfga/pull/2566)
+- Shadow list objects' check resolver should use its own cache. [#2574](https://github.com/openfga/openfga/pull/2574)
+- Improve performance for list objects intersection/exclusion with `enable-list-objects-optimizations` flag. [#2569](https://github.com/openfga/openfga/pull/2569)
+
+## [1.9.1] - 2025-07-22
+### Changed
+- **WARNING:** This is an incorrect version and should not be used. Please upgrade to version `v1.9.2` and do not use its companion docker image with the sha:
+  `sha256:71212e9aa2f26cd74287babf7eb92743b8510960388ff0b5ac68d89a23728898`
+
+## [1.9.0] - 2025-07-03
+### Added
+- Add separate reverse_expand path utilizing the weighted graph. Gated behind `enable-list-objects-optimizations` flag. [#2529](https://github.com/openfga/openfga/pull/2529)
+
 ### Changed
 - SQLite based iterators will load tuples only when needed (lazy loading). [#2511](https://github.com/openfga/openfga/pull/2511)
+- Shared iterator improvement to reduce lock contention when creating and cloning. [#2530](https://github.com/openfga/openfga/pull/2530)
+- Enable experimental list object optimizations in shadow mode using flag `enable-list-objects-optimizations`. [#2509](https://github.com/openfga/openfga/pull/2509)
+- Invalidated iterators will be removed from cache if an invalid entity entry is found allowing for less time to refresh. [#2536](https://github.com/openfga/openfga/pull/2536)
+- Shared iterator cache map split into a single map per datastore operation. [#2549](https://github.com/openfga/openfga/pull/2549)
+- Shared Iterator cloning performance improvement. [#2551](https://github.com/openfga/openfga/pull/2551)
+- Shared iterator performance enhancements. [#2553](https://github.com/openfga/openfga/pull/2553)
 
 ### Fixed
 - Cache Controller was always completely invalidating. [#2522](https://github.com/openfga/openfga/pull/2522)
@@ -1329,7 +1423,14 @@ Re-release of `v0.3.5` because the go module proxy cached a prior commit of the 
 - Memory storage adapter implementation
 - Early support for preshared key or OIDC authentication methods
 
-[Unreleased]: https://github.com/openfga/openfga/compare/v1.8.16...HEAD
+[Unreleased]: https://github.com/openfga/openfga/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/openfga/openfga/compare/v1.9.5...v1.10.0
+[1.9.5]: https://github.com/openfga/openfga/compare/v1.9.4...v1.9.5
+[1.9.4]: https://github.com/openfga/openfga/compare/v1.9.3...v1.9.4
+[1.9.3]: https://github.com/openfga/openfga/compare/v1.9.2...v1.9.3
+[1.9.2]: https://github.com/openfga/openfga/compare/v1.9.1...v1.9.2
+[1.9.1]: https://github.com/openfga/openfga/compare/v1.9.0...v1.9.1
+[1.9.0]: https://github.com/openfga/openfga/compare/v1.8.16...v1.9.0
 [1.8.16]: https://github.com/openfga/openfga/compare/v1.8.15...v1.8.16
 [1.8.15]: https://github.com/openfga/openfga/compare/v1.8.14...v1.8.15
 [1.8.14]: https://github.com/openfga/openfga/compare/v1.8.13...v1.8.14

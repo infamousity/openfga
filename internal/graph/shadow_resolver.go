@@ -55,7 +55,9 @@ var _ CheckResolver = (*ShadowResolver)(nil)
 
 func (s ShadowResolver) ResolveCheck(ctx context.Context, req *ResolveCheckRequest) (*ResolveCheckResponse, error) {
 	ctxClone := context.WithoutCancel(ctx) // needs typesystem and datastore etc
+	mainStart := time.Now()
 	res, err := s.main.ResolveCheck(ctx, req)
+	mainDuration := time.Since(mainStart)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +69,8 @@ func (s ShadowResolver) ResolveCheck(ctx context.Context, req *ResolveCheckReque
 		reqClone.VisitedPaths = nil // reset completely for evaluation
 		s.wg.Add(1)
 		go func() {
+			defer s.wg.Done()
+
 			defer func() {
 				if r := recover(); r != nil {
 					s.logger.ErrorWithContext(ctx, "panic recovered",
@@ -80,10 +84,11 @@ func (s ShadowResolver) ResolveCheck(ctx context.Context, req *ResolveCheckReque
 				}
 			}()
 
-			defer s.wg.Done()
 			ctx, cancel := context.WithTimeout(ctxClone, s.shadowTimeout)
 			defer cancel()
+			shadowStart := time.Now()
 			shadowRes, err := s.shadow.ResolveCheck(ctx, reqClone)
+			shadowDuration := time.Since(shadowStart)
 			if err != nil {
 				s.logger.WarnWithContext(ctx, "shadow check errored",
 					zap.String("resolver", s.name),
@@ -101,9 +106,16 @@ func (s ShadowResolver) ResolveCheck(ctx context.Context, req *ResolveCheckReque
 					zap.String("store_id", reqClone.GetStoreID()),
 					zap.String("model_id", reqClone.GetAuthorizationModelID()),
 					zap.Bool("main", resClone.GetAllowed()),
-					zap.Bool("main-cycle", resClone.GetCycleDetected()),
+					zap.Bool("main_cycle", resClone.GetCycleDetected()),
+					zap.Int64("main_latency", mainDuration.Milliseconds()),
 					zap.Bool("shadow", shadowRes.GetAllowed()),
-					zap.Bool("shadow-cycle", shadowRes.GetCycleDetected()),
+					zap.Bool("shadow_cycle", shadowRes.GetCycleDetected()),
+					zap.Int64("shadow_latency", shadowDuration.Milliseconds()),
+				)
+			} else {
+				s.logger.InfoWithContext(ctx, "shadow check match",
+					zap.Int64("main_latency", mainDuration.Milliseconds()),
+					zap.Int64("shadow_latency", shadowDuration.Milliseconds()),
 				)
 			}
 		}()

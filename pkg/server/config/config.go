@@ -21,7 +21,6 @@ const (
 	DefaultChangelogHorizonOffset           = 0
 	DefaultResolveNodeLimit                 = 25
 	DefaultResolveNodeBreadthLimit          = 10
-	DefaultUsersetBatchSize                 = 1000
 	DefaultListObjectsDeadline              = 3 * time.Second
 	DefaultListObjectsMaxResults            = 1000
 	DefaultMaxConcurrentReadsForCheck       = math.MaxUint32
@@ -40,6 +39,8 @@ const (
 	DefaultCheckQueryCacheEnabled = false
 	DefaultCheckQueryCacheTTL     = 10 * time.Second
 
+	DefaultShadowCheckCacheEnabled = false
+
 	DefaultCheckIteratorCacheEnabled    = false
 	DefaultCheckIteratorCacheMaxResults = 10000
 	DefaultCheckIteratorCacheTTL        = 10 * time.Second
@@ -47,6 +48,8 @@ const (
 	DefaultListObjectsIteratorCacheEnabled    = false
 	DefaultListObjectsIteratorCacheMaxResults = 10000
 	DefaultListObjectsIteratorCacheTTL        = 10 * time.Second
+
+	DefaultListObjectsOptimizationsEnabled = false
 
 	DefaultCacheControllerConfigEnabled = false
 	DefaultCacheControllerConfigTTL     = 10 * time.Second
@@ -58,6 +61,11 @@ const (
 	DefaultShadowListObjectsCheckResolverEnabled  = false
 	DefaultShadowListObjectsCheckSamplePercentage = 10
 	DefaultShadowListObjectsCheckResolverTimeout  = 1 * time.Second
+
+	DefaultShadowListObjectsQueryEnabled          = false
+	DefaultShadowListObjectsQuerySamplePercentage = 10
+	DefaultShadowListObjectsQueryTimeout          = 1 * time.Second
+	DefaultShadowListObjectsQueryMaxDeltaItems    = 100
 
 	// Care should be taken here - decreasing can cause API compatibility problems with Conditions.
 	DefaultMaxConditionEvaluationCost = 100
@@ -89,6 +97,11 @@ const (
 	DefaultSharedIteratorLimit            = 1000000
 	DefaultSharedIteratorTTL              = 4 * time.Minute
 	DefaultSharedIteratorMaxAdmissionTime = 10 * time.Second
+	DefaultSharedIteratorMaxIdleTime      = 1 * time.Second
+
+	DefaultPlannerInitialGuess      = 10 * time.Millisecond
+	DefaultPlannerEvictionThreshold = 0
+	DefaultPlannerCleanupInterval   = 0
 )
 
 type DatastoreMetricsConfig struct {
@@ -280,6 +293,12 @@ type AccessControlConfig struct {
 	ModelID string
 }
 
+type PlannerConfig struct {
+	InitialGuess      time.Duration
+	EvictionThreshold time.Duration
+	CleanupInterval   time.Duration
+}
+
 type Config struct {
 	// If you change any of these settings, please update the documentation at
 	// https://github.com/openfga/openfga.dev/blob/main/docs/content/intro/setup-openfga.mdx
@@ -385,6 +404,7 @@ type Config struct {
 	ListUsersDatabaseThrottle     DatabaseThrottleConfig
 	ListObjectsIteratorCache      IteratorCacheConfig
 	SharedIterator                SharedIteratorConfig
+	Planner                       PlannerConfig
 
 	RequestDurationDatastoreQueryCountBuckets []string
 	RequestDurationDispatchCountBuckets       []string
@@ -797,6 +817,11 @@ func DefaultConfig() *Config {
 		},
 		RequestTimeout:                DefaultRequestTimeout,
 		ContextPropagationToDatastore: false,
+		Planner: PlannerConfig{
+			InitialGuess:      DefaultPlannerInitialGuess,
+			EvictionThreshold: DefaultPlannerEvictionThreshold,
+			CleanupInterval:   DefaultPlannerCleanupInterval,
+		},
 	}
 }
 

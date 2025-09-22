@@ -31,16 +31,43 @@ func TestPostgresDatastore(t *testing.T) {
 	require.NoError(t, err)
 	defer ds.Close()
 	test.RunAllTests(t, ds)
+
+	// Run tests with a custom large max_tuples_per_write value.
+	dsCustom, err := New(uri, sqlcommon.NewConfig(
+		sqlcommon.WithMaxTuplesPerWrite(5000),
+	))
+	require.NoError(t, err)
+	defer dsCustom.Close()
+
+	t.Run("WriteTuplesWithMaxTuplesPerWrite", test.WriteTuplesWithMaxTuplesPerWrite(dsCustom, context.Background()))
+}
+
+func TestPostgresDatastoreStartup(t *testing.T) {
+	primaryDatastore := storagefixtures.RunDatastoreTestContainer(t, "postgres")
+	primaryURI := primaryDatastore.GetConnectionURI(true)
+
+	cfg := sqlcommon.NewConfig()
+	cfg.ExportMetrics = true
+
+	ds, err := New(primaryURI, cfg)
+	require.NoError(t, err)
+	defer ds.Close()
+
+	status, err := ds.IsReady(context.Background())
+	require.NoError(t, err)
+	require.True(t, status.IsReady)
 }
 
 func TestPostgresDatastoreStatusWithSecondaryDB(t *testing.T) {
 	primaryDatastore := storagefixtures.RunDatastoreTestContainer(t, "postgres")
-	primaryDatastore.CreateSecondary(t)
+	err := primaryDatastore.CreateSecondary(t)
+	require.NoError(t, err)
 
 	primaryURI := primaryDatastore.GetConnectionURI(true)
 
 	cfg := sqlcommon.NewConfig()
 	cfg.SecondaryURI = primaryDatastore.GetSecondaryConnectionURI(true)
+	cfg.ExportMetrics = true
 
 	ds, err := New(primaryURI, cfg)
 	require.NoError(t, err)
@@ -102,6 +129,7 @@ func TestReadEnsureNoOrder(t *testing.T) {
 				store,
 				[]*openfgav1.TupleKeyWithoutCondition{},
 				[]*openfgav1.TupleKey{firstTuple},
+				storage.NewTupleWriteOptions(),
 				time.Now())
 			require.NoError(t, err)
 
@@ -111,6 +139,7 @@ func TestReadEnsureNoOrder(t *testing.T) {
 				store,
 				[]*openfgav1.TupleKeyWithoutCondition{},
 				[]*openfgav1.TupleKey{secondTuple},
+				storage.NewTupleWriteOptions(),
 				time.Now().Add(time.Minute*-1))
 			require.NoError(t, err)
 
@@ -119,6 +148,7 @@ func TestReadEnsureNoOrder(t *testing.T) {
 				store,
 				[]*openfgav1.TupleKeyWithoutCondition{},
 				[]*openfgav1.TupleKey{thirdTuple},
+				storage.NewTupleWriteOptions(),
 				time.Now().Add(time.Minute*-2))
 			require.NoError(t, err)
 
@@ -204,6 +234,7 @@ func TestCtxCancel(t *testing.T) {
 				store,
 				[]*openfgav1.TupleKeyWithoutCondition{},
 				[]*openfgav1.TupleKey{firstTuple},
+				storage.NewTupleWriteOptions(),
 				time.Now())
 			require.NoError(t, err)
 
@@ -213,6 +244,7 @@ func TestCtxCancel(t *testing.T) {
 				store,
 				[]*openfgav1.TupleKeyWithoutCondition{},
 				[]*openfgav1.TupleKey{secondTuple},
+				storage.NewTupleWriteOptions(),
 				time.Now().Add(time.Minute*-1))
 			require.NoError(t, err)
 
@@ -221,6 +253,7 @@ func TestCtxCancel(t *testing.T) {
 				store,
 				[]*openfgav1.TupleKeyWithoutCondition{},
 				[]*openfgav1.TupleKey{thirdTuple},
+				storage.NewTupleWriteOptions(),
 				time.Now().Add(time.Minute*-2))
 			require.NoError(t, err)
 
@@ -264,6 +297,7 @@ func TestReadPageEnsureOrder(t *testing.T) {
 		store,
 		[]*openfgav1.TupleKeyWithoutCondition{},
 		[]*openfgav1.TupleKey{firstTuple},
+		storage.NewTupleWriteOptions(),
 		time.Now())
 	require.NoError(t, err)
 
@@ -273,6 +307,7 @@ func TestReadPageEnsureOrder(t *testing.T) {
 		store,
 		[]*openfgav1.TupleKeyWithoutCondition{},
 		[]*openfgav1.TupleKey{secondTuple},
+		storage.NewTupleWriteOptions(),
 		time.Now().Add(time.Minute*-1))
 	require.NoError(t, err)
 

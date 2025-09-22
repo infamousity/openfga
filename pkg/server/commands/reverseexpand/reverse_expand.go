@@ -11,14 +11,17 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+	weightedGraph "github.com/openfga/language/pkg/go/graph"
 
 	"github.com/openfga/openfga/internal/concurrency"
 	"github.com/openfga/openfga/internal/condition"
 	"github.com/openfga/openfga/internal/condition/eval"
 	"github.com/openfga/openfga/internal/graph"
+	"github.com/openfga/openfga/internal/stack"
 	"github.com/openfga/openfga/internal/throttler"
 	"github.com/openfga/openfga/internal/throttler/threshold"
 	"github.com/openfga/openfga/internal/validation"
@@ -41,7 +44,19 @@ type ReverseExpandRequest struct {
 	Context          *structpb.Struct
 	Consistency      openfgav1.ConsistencyPreference
 
-	edge *graph.RelationshipEdge
+	edge              *graph.RelationshipEdge
+	skipWeightedGraph bool
+
+	weightedEdge  *weightedGraph.WeightedAuthorizationModelEdge
+	relationStack stack.Stack[typeRelEntry]
+}
+
+func (r *ReverseExpandRequest) clone() *ReverseExpandRequest {
+	if r == nil {
+		return nil
+	}
+	copyRequest := *r
+	return &copyRequest
 }
 
 type IsUserRef interface {
@@ -123,8 +138,13 @@ type ReverseExpandQuery struct {
 	// candidateObjectsMap map prevents returning the same object twice
 	candidateObjectsMap *sync.Map
 
+	// queryDedupeMap prevents multiple branches of exploration from running
+	// the same queries, since multiple leaf nodes can have a common ancestor
+	queryDedupeMap *sync.Map
+
 	// localCheckResolver allows reverse expand to call check locally
-	localCheckResolver *graph.LocalChecker
+	localCheckResolver   graph.CheckRewriteResolver
+	optimizationsEnabled bool
 }
 
 type ReverseExpandQueryOption func(d *ReverseExpandQuery)
@@ -156,6 +176,12 @@ func WithCheckResolver(resolver graph.CheckResolver) ReverseExpandQueryOption {
 	}
 }
 
+func WithListObjectOptimizationsEnabled(enabled bool) ReverseExpandQueryOption {
+	return func(d *ReverseExpandQuery) {
+		d.optimizationsEnabled = enabled
+	}
+}
+
 // TODO accept ReverseExpandRequest so we can build the datastore object right away.
 func NewReverseExpandQuery(ds storage.RelationshipTupleReader, ts *typesystem.TypeSystem, opts ...ReverseExpandQueryOption) *ReverseExpandQuery {
 	query := &ReverseExpandQuery{
@@ -172,6 +198,7 @@ func NewReverseExpandQuery(ds storage.RelationshipTupleReader, ts *typesystem.Ty
 		},
 		candidateObjectsMap: new(sync.Map),
 		visitedUsersetsMap:  new(sync.Map),
+		queryDedupeMap:      new(sync.Map),
 		localCheckResolver:  graph.NewLocalChecker(),
 	}
 
@@ -200,12 +227,26 @@ type ResolutionMetadata struct {
 
 	// WasThrottled indicates whether the request was throttled
 	WasThrottled *atomic.Bool
+
+	// WasWeightedGraphUsed indicates whether the weighted graph was used as the algorithm for the ReverseExpand request.
+	WasWeightedGraphUsed *atomic.Bool
+
+	// The number of times internal check was called for the optimization path
+	CheckCounter *atomic.Uint32
+
+	// Temporary solution to indicate whether shadow list objects query should be run.
+	// For queries with Infinite weight, the weighted graph implementation falls back
+	// to the original code, making any comparison useless.
+	ShouldRunShadowQuery *atomic.Bool
 }
 
 func NewResolutionMetadata() *ResolutionMetadata {
 	return &ResolutionMetadata{
-		DispatchCounter: new(atomic.Uint32),
-		WasThrottled:    new(atomic.Bool),
+		DispatchCounter:      new(atomic.Uint32),
+		WasThrottled:         new(atomic.Bool),
+		WasWeightedGraphUsed: new(atomic.Bool),
+		ShouldRunShadowQuery: new(atomic.Bool),
+		CheckCounter:         new(atomic.Uint32),
 	}
 }
 
@@ -213,6 +254,18 @@ func WithLogger(logger logger.Logger) ReverseExpandQueryOption {
 	return func(d *ReverseExpandQuery) {
 		d.logger = logger
 	}
+}
+
+// shallowClone creates an identical copy of reverseExpandQuery except
+// candidateObjectsMap as list object candidates need to be validated
+// via check.
+func (c *ReverseExpandQuery) shallowClone() *ReverseExpandQuery {
+	if c == nil {
+		return nil
+	}
+	copy := *c
+	copy.candidateObjectsMap = new(sync.Map)
+	return &copy
 }
 
 // Execute yields all the objects of the provided objectType that the
@@ -233,6 +286,7 @@ func (c *ReverseExpandQuery) Execute(
 	resultChan chan<- *ReverseExpandResult,
 	resolutionMetadata *ResolutionMetadata,
 ) error {
+	ctx = storage.ContextWithRelationshipTupleReader(ctx, c.datastore)
 	err := c.execute(ctx, req, resultChan, false, resolutionMetadata)
 	if err != nil {
 		return err
@@ -311,6 +365,10 @@ func (c *ReverseExpandQuery) execute(
 		sourceUserObj = userset.ObjectRelation.GetObject()
 		sourceUserRef = typesystem.DirectRelationReference(sourceUserType, userset.ObjectRelation.GetRelation())
 
+		// Queries that come in explicitly looking for userset relations will skip weighted graph for now.
+		// e.g. ListObjects(document, viewer, team:fga#member)
+		req.skipWeightedGraph = true
+
 		if req.edge != nil {
 			key := fmt.Sprintf("%s#%s", sourceUserObj, req.edge.String())
 			if _, loaded := c.visitedUsersetsMap.LoadOrStore(key, struct{}{}); loaded {
@@ -321,13 +379,81 @@ func (c *ReverseExpandQuery) execute(
 
 		// ReverseExpand(type=document, rel=viewer, user=document:1#viewer) will return "document:1"
 		if tuple.UsersetMatchTypeAndRelation(userset.String(), req.Relation, req.ObjectType) {
-			if err := c.trySendCandidate(ctx, intersectionOrExclusionInPreviousEdges, sourceUserObj, resultChan); err != nil {
-				return err
-			}
+			c.trySendCandidate(ctx, intersectionOrExclusionInPreviousEdges, sourceUserObj, resultChan)
 		}
 	}
 
 	targetObjRef := typesystem.DirectRelationReference(req.ObjectType, req.Relation)
+
+	if c.optimizationsEnabled && !req.skipWeightedGraph {
+		var typeRel string
+		if req.weightedEdge != nil {
+			typeRel = req.weightedEdge.GetTo().GetUniqueLabel()
+		} else { // true on first call to ReverseExpand
+			typeRel = tuple.ToObjectRelationString(targetObjRef.GetType(), targetObjRef.GetRelation())
+			node, ok := c.typesystem.GetNode(typeRel)
+			if !ok {
+				// The weighted graph is not guaranteed to be present.
+				// If there's no weighted graph, which can happen for models with tuple cycles, we will log an error below
+				// and then fall back to the non-weighted version of reverse_expand
+				c.logger.InfoWithContext(ctx, "unable to find node in weighted graph", zap.String("node_id", typeRel))
+				req.skipWeightedGraph = true
+			} else {
+				weight, _ := node.GetWeight(sourceUserType)
+				if weight == weightedGraph.Infinite {
+					c.logger.InfoWithContext(ctx, "reverse_expand graph may contain cycle, skipping weighted graph", zap.String("node_id", typeRel))
+					req.skipWeightedGraph = true
+				}
+			}
+		}
+
+		if !req.skipWeightedGraph {
+			if req.weightedEdge == nil { // true on the first invocation only
+				req.relationStack = stack.Push(nil, typeRelEntry{typeRel: typeRel})
+			}
+
+			edges, _ := c.typesystem.GetConnectedEdges(
+				typeRel,
+				sourceUserType,
+			)
+			// error should never happen as if the weighted graph failed to build, req.skipWeightedGraph would
+			// have prevented us from entering this block
+
+			// Set value to indicate that the weighted graph was used
+			resolutionMetadata.WasWeightedGraphUsed.Store(true)
+
+			return c.loopOverEdges(
+				ctx,
+				req,
+				edges,
+				intersectionOrExclusionInPreviousEdges,
+				resolutionMetadata,
+				resultChan,
+				sourceUserType,
+			)
+		}
+	}
+
+	// NOTE: this is temporary to ensure that the ListObjects shadow query doesn't run unnecessarily.
+	// For cases where the query is weight INF, reverse_expand_weighted falls back to original reverse_expand,
+	// so there is no value in running a shadow query after the main query completes.
+	// This block will hit on the first pass through reverse_expand, and it marks ShouldRunShadowQuery based on
+	// whether the shadow query will actually run the code we want to test.
+	if !req.skipWeightedGraph {
+		req.skipWeightedGraph = true // ensure we don't do this on subsequent recursive calls
+		resolutionMetadata.ShouldRunShadowQuery.Store(true)
+
+		typeRel := tuple.ToObjectRelationString(targetObjRef.GetType(), targetObjRef.GetRelation())
+		node, ok := c.typesystem.GetNode(typeRel)
+		if !ok {
+			resolutionMetadata.ShouldRunShadowQuery.Store(false)
+		} else {
+			weight, _ := node.GetWeight(sourceUserType)
+			if weight == weightedGraph.Infinite {
+				resolutionMetadata.ShouldRunShadowQuery.Store(false)
+			}
+		}
+	}
 
 	g := graph.New(c.typesystem)
 
@@ -345,14 +471,15 @@ LoopOnEdges:
 		innerLoopEdge := edge
 		intersectionOrExclusionInPreviousEdges := intersectionOrExclusionInPreviousEdges || innerLoopEdge.TargetReferenceInvolvesIntersectionOrExclusion
 		r := &ReverseExpandRequest{
-			StoreID:          req.StoreID,
-			ObjectType:       req.ObjectType,
-			Relation:         req.Relation,
-			User:             req.User,
-			ContextualTuples: req.ContextualTuples,
-			Context:          req.Context,
-			edge:             innerLoopEdge,
-			Consistency:      req.Consistency,
+			StoreID:           req.StoreID,
+			ObjectType:        req.ObjectType,
+			Relation:          req.Relation,
+			User:              req.User,
+			ContextualTuples:  req.ContextualTuples,
+			Context:           req.Context,
+			edge:              innerLoopEdge,
+			Consistency:       req.Consistency,
+			skipWeightedGraph: req.skipWeightedGraph,
 		}
 		switch innerLoopEdge.Type {
 		case graph.DirectEdge:
@@ -377,7 +504,7 @@ LoopOnEdges:
 				return c.reverseExpandTupleToUserset(ctx, r, resultChan, intersectionOrExclusionInPreviousEdges, resolutionMetadata)
 			})
 		default:
-			panic("unsupported edge type")
+			return fmt.Errorf("unsupported edge type: %v", innerLoopEdge.Type)
 		}
 	}
 
@@ -605,7 +732,12 @@ LoopOnIterator:
 	return nil
 }
 
-func (c *ReverseExpandQuery) trySendCandidate(ctx context.Context, intersectionOrExclusionInPreviousEdges bool, candidateObject string, candidateChan chan<- *ReverseExpandResult) error {
+func (c *ReverseExpandQuery) trySendCandidate(
+	ctx context.Context,
+	intersectionOrExclusionInPreviousEdges bool,
+	candidateObject string,
+	candidateChan chan<- *ReverseExpandResult,
+) {
 	_, span := tracer.Start(ctx, "trySendCandidate", trace.WithAttributes(
 		attribute.String("object", candidateObject),
 		attribute.Bool("sent", false),
@@ -619,18 +751,12 @@ func (c *ReverseExpandQuery) trySendCandidate(ctx context.Context, intersectionO
 			resultStatus = RequiresFurtherEvalStatus
 		}
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case candidateChan <- &ReverseExpandResult{
-			Object:       candidateObject,
-			ResultStatus: resultStatus,
-		}:
+		result := &ReverseExpandResult{Object: candidateObject, ResultStatus: resultStatus}
+		ok = concurrency.TrySendThroughChannel(ctx, result, candidateChan)
+		if ok {
 			span.SetAttributes(attribute.Bool("sent", true))
 		}
 	}
-
-	return nil
 }
 
 func (c *ReverseExpandQuery) throttle(ctx context.Context, currentNumDispatch uint32, metadata *ResolutionMetadata) {
