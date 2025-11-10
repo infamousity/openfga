@@ -12,7 +12,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/protobuf/types/known/structpb"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 
@@ -305,6 +304,7 @@ func (l *listUsersQuery) ListUsers(
 		Users: foundUsers,
 		Metadata: listUsersResponseMetadata{
 			DatastoreQueryCount: dsMeta.DatastoreQueryCount,
+			DatastoreItemCount:  dsMeta.DatastoreItemCount,
 			DispatchCounter:     &dispatchCount,
 			WasThrottled:        l.wasThrottled,
 		},
@@ -455,7 +455,7 @@ func (l *listUsersQuery) expandDirect(
 			Preference: req.GetConsistency(),
 		},
 	}
-	iter, err := l.datastore.Read(ctx, req.GetStoreId(), &openfgav1.TupleKey{
+	iter, err := l.datastore.Read(ctx, req.GetStoreId(), storage.ReadFilter{
 		Object:   tuple.ObjectKey(req.GetObject()),
 		Relation: req.GetRelation(),
 	}, opts)
@@ -488,7 +488,8 @@ LoopOnIterator:
 			break LoopOnIterator
 		}
 
-		condMet, err := tupleConditionMet(ctx, req.GetContext(), typesys, tupleKey)
+		cond, _ := typesys.GetCondition(tupleKey.GetCondition().GetName())
+		condMet, err := eval.EvaluateTupleCondition(ctx, tupleKey, cond, req.Context)
 		if err != nil {
 			errs = errors.Join(errs, err)
 			if !errors.Is(err, condition.ErrEvaluationFailed) {
@@ -882,7 +883,7 @@ func (l *listUsersQuery) expandTTU(
 			Preference: req.GetConsistency(),
 		},
 	}
-	iter, err := l.datastore.Read(ctx, req.GetStoreId(), &openfgav1.TupleKey{
+	iter, err := l.datastore.Read(ctx, req.GetStoreId(), storage.ReadFilter{
 		Object:   tuple.ObjectKey(req.GetObject()),
 		Relation: tuplesetRelation,
 	}, opts)
@@ -915,7 +916,8 @@ LoopOnIterator:
 			break LoopOnIterator
 		}
 
-		condMet, err := tupleConditionMet(ctx, req.GetContext(), typesys, tupleKey)
+		cond, _ := typesys.GetCondition(tupleKey.GetCondition().GetName())
+		condMet, err := eval.EvaluateTupleCondition(ctx, tupleKey, cond, req.Context)
 		if err != nil {
 			errs = errors.Join(errs, err)
 			if !errors.Is(err, condition.ErrEvaluationFailed) {
@@ -966,24 +968,6 @@ func (l *listUsersQuery) buildResultsChannel() chan foundUser {
 	}
 
 	return foundUsersCh
-}
-
-func tupleConditionMet(ctx context.Context, reqCtx *structpb.Struct, typesys *typesystem.TypeSystem, t *openfgav1.TupleKey) (bool, error) {
-	condEvalResult, err := eval.EvaluateTupleCondition(ctx, t, typesys, reqCtx)
-	if err != nil {
-		return false, err
-	}
-
-	if len(condEvalResult.MissingParameters) > 0 {
-		return false, condition.NewEvaluationError(
-			t.GetCondition().GetName(),
-			fmt.Errorf("tuple '%s' is missing context parameters '%v'",
-				tuple.TupleKeyToString(t),
-				condEvalResult.MissingParameters),
-		)
-	}
-
-	return condEvalResult.ConditionMet, nil
 }
 
 func panicError(recovered *panics.Recovered) error {

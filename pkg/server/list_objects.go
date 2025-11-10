@@ -14,11 +14,13 @@ import (
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 
 	"github.com/openfga/openfga/internal/condition"
+	"github.com/openfga/openfga/internal/graph"
 	"github.com/openfga/openfga/internal/throttler/threshold"
 	"github.com/openfga/openfga/internal/utils"
 	"github.com/openfga/openfga/internal/utils/apimethod"
 	"github.com/openfga/openfga/pkg/middleware/validator"
 	"github.com/openfga/openfga/pkg/server/commands"
+	serverconfig "github.com/openfga/openfga/pkg/server/config"
 	serverErrors "github.com/openfga/openfga/pkg/server/errors"
 	"github.com/openfga/openfga/pkg/telemetry"
 	"github.com/openfga/openfga/pkg/typesystem"
@@ -64,16 +66,23 @@ func (s *Server) ListObjects(ctx context.Context, req *openfgav1.ListObjectsRequ
 		return nil, err
 	}
 
+	builder := s.getListObjectsCheckResolverBuilder(req.GetStoreId())
+	checkResolver, checkResolverCloser, err := builder.Build()
+	if err != nil {
+		return nil, err
+	}
+	defer checkResolverCloser()
+
 	q, err := commands.NewListObjectsQueryWithShadowConfig(
 		s.datastore,
-		s.listObjectsCheckResolver,
+		checkResolver,
 		commands.NewShadowListObjectsQueryConfig(
-			commands.WithShadowListObjectsQueryEnabled(s.shadowListObjectsQueryEnabled),
-			commands.WithShadowListObjectsQuerySamplePercentage(s.shadowListObjectsQuerySamplePercentage),
+			commands.WithShadowListObjectsQueryEnabled(s.featureFlagClient.Boolean(serverconfig.ExperimentalShadowListObjects, req.GetStoreId())),
 			commands.WithShadowListObjectsQueryTimeout(s.shadowListObjectsQueryTimeout),
 			commands.WithShadowListObjectsQueryMaxDeltaItems(s.shadowListObjectsQueryMaxDeltaItems),
 			commands.WithShadowListObjectsQueryLogger(s.logger),
 		),
+		req.GetStoreId(),
 		commands.WithLogger(s.logger),
 		commands.WithListObjectsDeadline(s.listObjectsDeadline),
 		commands.WithListObjectsMaxResults(s.listObjectsMaxResults),
@@ -87,8 +96,12 @@ func (s *Server) ListObjects(ctx context.Context, req *openfgav1.ListObjectsRequ
 		commands.WithResolveNodeBreadthLimit(s.resolveNodeBreadthLimit),
 		commands.WithMaxConcurrentReads(s.maxConcurrentReadsForListObjects),
 		commands.WithListObjectsCache(s.sharedDatastoreResources, s.cacheSettings),
-		commands.WithListObjectsDatastoreThrottler(s.listObjectsDatastoreThrottleThreshold, s.listObjectsDatastoreThrottleDuration),
-		commands.WithListObjectsOptimizationsEnabled(s.IsExperimentallyEnabled(ExperimentalListObjectsOptimizations)),
+		commands.WithListObjectsDatastoreThrottler(
+			s.featureFlagClient.Boolean(serverconfig.ExperimentalDatastoreThrottling, storeID),
+			s.listObjectsDatastoreThrottleThreshold,
+			s.listObjectsDatastoreThrottleDuration,
+		),
+		commands.WithFeatureFlagClient(s.featureFlagClient),
 	)
 	if err != nil {
 		return nil, serverErrors.NewInternalError("", err)
@@ -123,6 +136,15 @@ func (s *Server) ListObjects(ctx context.Context, req *openfgav1.ListObjectsRequ
 		s.serviceName,
 		methodName,
 	).Observe(datastoreQueryCount)
+
+	datastoreItemCount := float64(result.ResolutionMetadata.DatastoreItemCount.Load())
+
+	grpc_ctxtags.Extract(ctx).Set(datastoreItemCountHistogramName, datastoreItemCount)
+	span.SetAttributes(attribute.Float64(datastoreItemCountHistogramName, datastoreItemCount))
+	datastoreItemCountHistogram.WithLabelValues(
+		s.serviceName,
+		methodName,
+	).Observe(datastoreItemCount)
 
 	dispatchCount := float64(result.ResolutionMetadata.DispatchCounter.Load())
 
@@ -199,16 +221,23 @@ func (s *Server) StreamedListObjects(req *openfgav1.StreamedListObjectsRequest, 
 		return err
 	}
 
+	builder := s.getListObjectsCheckResolverBuilder(req.GetStoreId())
+	checkResolver, checkResolverCloser, err := builder.Build()
+	if err != nil {
+		return err
+	}
+	defer checkResolverCloser()
+
 	q, err := commands.NewListObjectsQueryWithShadowConfig(
 		s.datastore,
-		s.listObjectsCheckResolver,
+		checkResolver,
 		commands.NewShadowListObjectsQueryConfig(
-			commands.WithShadowListObjectsQueryEnabled(s.shadowListObjectsQueryEnabled),
-			commands.WithShadowListObjectsQuerySamplePercentage(s.shadowListObjectsQuerySamplePercentage),
+			commands.WithShadowListObjectsQueryEnabled(s.featureFlagClient.Boolean(serverconfig.ExperimentalShadowListObjects, req.GetStoreId())),
 			commands.WithShadowListObjectsQueryTimeout(s.shadowListObjectsQueryTimeout),
 			commands.WithShadowListObjectsQueryMaxDeltaItems(s.shadowListObjectsQueryMaxDeltaItems),
 			commands.WithShadowListObjectsQueryLogger(s.logger),
 		),
+		req.GetStoreId(),
 		commands.WithLogger(s.logger),
 		commands.WithListObjectsDeadline(s.listObjectsDeadline),
 		commands.WithDispatchThrottlerConfig(threshold.Config{
@@ -221,6 +250,7 @@ func (s *Server) StreamedListObjects(req *openfgav1.StreamedListObjectsRequest, 
 		commands.WithResolveNodeLimit(s.resolveNodeLimit),
 		commands.WithResolveNodeBreadthLimit(s.resolveNodeBreadthLimit),
 		commands.WithMaxConcurrentReads(s.maxConcurrentReadsForListObjects),
+		commands.WithFeatureFlagClient(s.featureFlagClient),
 	)
 	if err != nil {
 		return serverErrors.NewInternalError("", err)
@@ -246,6 +276,15 @@ func (s *Server) StreamedListObjects(req *openfgav1.StreamedListObjectsRequest, 
 		methodName,
 	).Observe(datastoreQueryCount)
 
+	datastoreItemCount := float64(resolutionMetadata.DatastoreItemCount.Load())
+
+	grpc_ctxtags.Extract(ctx).Set(datastoreItemCountHistogramName, datastoreItemCount)
+	span.SetAttributes(attribute.Float64(datastoreItemCountHistogramName, datastoreItemCount))
+	datastoreItemCountHistogram.WithLabelValues(
+		s.serviceName,
+		methodName,
+	).Observe(datastoreItemCount)
+
 	dispatchCount := float64(resolutionMetadata.DispatchCounter.Load())
 
 	grpc_ctxtags.Extract(ctx).Set(dispatchCountHistogramName, dispatchCount)
@@ -269,4 +308,18 @@ func (s *Server) StreamedListObjects(req *openfgav1.StreamedListObjectsRequest, 
 	}
 
 	return nil
+}
+
+func (s *Server) getListObjectsCheckResolverBuilder(storeID string) *graph.CheckResolverOrderedBuilder {
+	checkCacheOptions, checkDispatchThrottlingOptions := s.getCheckResolverOptions()
+
+	return graph.NewOrderedCheckResolvers([]graph.CheckResolverOrderedBuilderOpt{
+		graph.WithLocalCheckerOpts([]graph.LocalCheckerOption{
+			graph.WithResolveNodeBreadthLimit(s.resolveNodeBreadthLimit),
+			graph.WithOptimizations(s.featureFlagClient.Boolean(serverconfig.ExperimentalCheckOptimizations, storeID)),
+			graph.WithMaxResolutionDepth(s.resolveNodeLimit),
+		}...),
+		graph.WithCachedCheckResolverOpts(s.cacheSettings.ShouldCacheCheckQueries(), checkCacheOptions...),
+		graph.WithDispatchThrottlingCheckResolverOpts(s.checkDispatchThrottlingEnabled, checkDispatchThrottlingOptions...),
+	}...)
 }
